@@ -9,7 +9,7 @@ namespace Bibim.Core
 {
     /// <summary>
     /// Windows balloon-tip notification service.
-    /// Shows a system tray notification when Bibim needs user attention.
+    /// Shows a system tray notification when SaraIA needs user attention.
     /// </summary>
     public static class WindowsNotificationService
     {
@@ -29,7 +29,7 @@ namespace Bibim.Core
                     {
                         _notifyIcon = new NotifyIcon();
                         _notifyIcon.Icon = LoadAppIcon();
-                        _notifyIcon.Text = "Bibim";
+                        _notifyIcon.Text = "SaraIA";
                     }
 
                     _notifyIcon.Visible = true;
@@ -47,10 +47,10 @@ namespace Bibim.Core
         /// </summary>
         public static void NotifyActionRequired()
         {
-            string title = "Bibim";
+            string title = "SaraIA";
             string message = AppLanguage.IsEnglish
-                ? "Action required — please check Bibim."
-                : "?? ??? ????? — Bibim? ??????.";
+                ? "Action required - please check SaraIA."
+                : "Accion requerida - revisa SaraIA.";
 
             ShowNotification(title, message);
         }

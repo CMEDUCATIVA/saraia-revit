@@ -8,6 +8,7 @@ namespace Bibim.Core
     /// </summary>
     public static class AppLanguage
     {
+        public const string Spanish = "es";
         public const string English = "en";
         public const string Korean = "kr";
 
@@ -20,20 +21,22 @@ namespace Bibim.Core
 #if APP_LANG_EN
                 return English;
 #else
-                return Korean;
+                return Spanish;
 #endif
             }
         }
 
         public static bool IsEnglish => string.Equals(Current, English, StringComparison.OrdinalIgnoreCase);
+        public static bool IsSpanish => string.Equals(Current, Spanish, StringComparison.OrdinalIgnoreCase);
 
         public static string Normalize(string language)
         {
             if (string.IsNullOrWhiteSpace(language)) return Default;
 
             string n = language.Trim().ToLowerInvariant();
+            if (n == "es" || n == "es-es" || n == "es-co" || n == "spanish" || n == "espanol" || n == "espa\u00f1ol") return Spanish;
             if (n == "en" || n == "en-us" || n == "english") return English;
-            if (n == "ko" || n == "ko-kr" || n == "kr" || n == "korean") return Korean;
+            if (n == "ko" || n == "ko-kr" || n == "kr" || n == "korean") return Spanish;
             return Default;
         }
 

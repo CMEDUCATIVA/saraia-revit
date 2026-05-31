@@ -27,7 +27,9 @@ namespace Bibim.Core
             {
                 _language = AppLanguage.Normalize(language);
                 _fallback = LoadDictionary(AppLanguage.English);
-                _strings = _language == AppLanguage.English ? _fallback : LoadDictionary(_language);
+                _strings = _language == AppLanguage.English || _language == AppLanguage.Spanish
+                    ? _fallback
+                    : LoadDictionary(_language);
                 _initialized = true;
             }
         }

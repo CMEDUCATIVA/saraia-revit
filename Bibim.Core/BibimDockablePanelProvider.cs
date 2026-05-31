@@ -261,7 +261,7 @@ namespace Bibim.Core
 
         private string UiText(string english, string korean)
         {
-            return AppLanguage.IsEnglish ? english : korean;
+            return AppLanguage.IsEnglish ? english : english;
         }
 
         private void EnsureActiveSession(bool createIfMissing = true)
@@ -924,9 +924,9 @@ namespace Bibim.Core
 
         private string BuildTaskPlannerPrompt()
         {
-            string outputLanguage = AppLanguage.IsEnglish ? "English" : "Korean";
+            string outputLanguage = AppLanguage.IsSpanish ? "Spanish" : (AppLanguage.IsEnglish ? "English" : "Korean");
             string categoryChecklist = CategoryQuestionTemplates.BuildPlannerChecklist();
-            return $@"You are the Bibim task planner for a Revit add-in.
+            return $@"You are the SaraIA task planner for a Revit add-in.
 Return JSON only. No markdown. No code fences. No explanations.
 
 Decide whether the latest user message is:
@@ -1414,7 +1414,7 @@ namespace BibimGenerated
             string executionLog = BuildExecutionLogContext();
             string commentLangRule = AppLanguage.IsEnglish
                 ? "\n- Write all C# code comments and user-visible string literals in English."
-                : "\n- ?? ??? ????? ???? ???? ?? ???? ?????.";
+                : "\n- Write all C# code comments and user-visible string literals in Spanish.";
 
             return $@"Implement the following Revit task.
 
@@ -1940,7 +1940,7 @@ Constraints:
                         string warningList = string.Join("\n", execResult.RevitWarnings.Select(w => $"- {w}"));
                         string warningPrompt = AppLanguage.IsEnglish
                             ? $"Execution succeeded, but the following Revit warnings occurred:\n{warningList}\n\nWould you like to regenerate the code to address these?"
-                            : $"?? ??? ?? ???, ?? Revit ??? ??????:\n{warningList}\n\n? ???? ???? ?? ??????";
+                            : $"La ejecución terminó correctamente, pero Revit generó estas advertencias:\n{warningList}\n\n¿Quieres regenerar el código para corregirlas?";
                         _lastRevitWarnings = execResult.RevitWarnings;
                         _bridge.PostMessage("revit_warning", new
                         {
@@ -1983,13 +1983,13 @@ Constraints:
 
                 string warningContext = AppLanguage.IsEnglish
                     ? "The previous code executed but triggered Revit warnings. Please regenerate to address them."
-                    : "?? ?? ?? ? Revit ??? ??????. ?? ????? ??? ?? ??????.";
+                    : "El código anterior se ejecutó, pero generó advertencias de Revit. Regenera el código para corregirlas.";
                 if (_lastRevitWarnings?.Count > 0)
                     warningContext += "\n\nRevit warnings:\n" + string.Join("\n", _lastRevitWarnings.Select(w => $"- {w}"));
                 if (!string.IsNullOrWhiteSpace(extraText))
                     warningContext += AppLanguage.IsEnglish
                         ? $"\n\nAdditional requirement: {extraText}"
-                        : $"\n\n?? ??: {extraText}";
+                        : $"\n\nRequisito adicional: {extraText}";
 
                 _bridge.PostMessage("progress", new[]
                 {

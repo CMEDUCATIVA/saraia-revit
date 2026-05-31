@@ -30,7 +30,7 @@ namespace Bibim.Core
 
             // Replace Korean example strings embedded in the prompts for EN builds.
             // These are inside code-pattern examples, not UI text, so they can't use UiText().
-            if (AppLanguage.IsEnglish)
+            if (AppLanguage.IsEnglish || AppLanguage.IsSpanish)
             {
                 prompt = prompt
                     .Replace("?? ??? ?? ?????",
@@ -117,8 +117,9 @@ WORKFLOW:
 IMPORTANT: If the documentation above conflicts with your training data, ALWAYS prefer the documentation above.";
         }
 
-        private static string BuildBasePrompt(string revitVersion) => $@"You are Bibim, an expert Revit C# code generator.
+        private static string BuildBasePrompt(string revitVersion) => $@"You are SaraIA, an expert Revit C# code generator.
 You generate C# code that runs inside Autodesk Revit via the Revit API.
+Default response language: Spanish. Answer all user-facing text in Spanish unless the user explicitly asks for another language.
 
 TARGET ENVIRONMENT:
 - Revit {revitVersion}
@@ -193,7 +194,7 @@ RESPONSE FORMAT for code requests:
 - If the request is unclear, ask clarifying questions instead of generating code
 
 RESPONSE FORMAT for non-code requests:
-- Answer naturally in the user's language
+- Answer naturally in Spanish unless the user explicitly asks for another language
 - Provide Revit API guidance when relevant";
 
         private static string BuildFileOutputRules() => @"

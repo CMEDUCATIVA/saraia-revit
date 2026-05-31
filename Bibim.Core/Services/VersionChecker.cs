@@ -80,8 +80,8 @@ namespace Bibim.Core
                     return VersionCheckResult.NoUpdateNeeded;
                 }
 
-                // Find matching asset: _EN_ for English build, _KO_ for Korean build
-                string langToken = AppLanguage.IsEnglish ? "_EN_" : "_KO_";
+                // Spanish builds use the English installer assets until a dedicated ES installer exists.
+                string langToken = AppLanguage.IsEnglish || AppLanguage.IsSpanish ? "_EN_" : "_KO_";
                 string downloadUrl = null;
                 var assets = release["assets"] as JArray;
                 if (assets != null)
