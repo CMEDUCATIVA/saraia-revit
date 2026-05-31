@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RevitAddIns>
+  <!-- SaraIA v2.4.0 — for Revit 2022-2024 (.NET 4.8) -->
+  <AddIn Type="Application">
+    <Name>SaraIA</Name>
+    <Assembly>C:\Program Files\SaraIA\net48\Bibim.Core.dll</Assembly>
+    <FullClassName>Bibim.Core.BibimApp</FullClassName>
+    <AddInId>B1B1B1B1-B1B1-B1B1-B1B1-B1B100030001</AddInId>
+    <VendorId>SaraIA</VendorId>
+    <VendorDescription>SaraIA — AI-powered Revit code generation</VendorDescription>
+  </AddIn>
+  <AddIn Type="Command">
+    <Name>SaraIA Show Panel</Name>
+    <Assembly>C:\Program Files\SaraIA\net48\Bibim.Core.dll</Assembly>
+    <FullClassName>Bibim.Core.BibimShowPanelCommand</FullClassName>
+    <AddInId>B1B1B1B1-B1B1-B1B1-B1B1-B1B100030002</AddInId>
+    <VendorId>SaraIA</VendorId>
+  </AddIn>
+</RevitAddIns>

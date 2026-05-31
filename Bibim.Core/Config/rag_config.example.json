@@ -1,0 +1,28 @@
+{
+  "detected_revit_version": "2025",
+  "active_store": "",
+  "claude_model": "claude-sonnet-4-6",
+  "gemini_model": "gemini-2.0-flash",
+  "api_keys": {
+    "claude_api_key": "YOUR_CLAUDE_API_KEY",
+    "gemini_api_key": ""
+  },
+  "stores": {
+    "2022": "",
+    "2023": "",
+    "2024": "",
+    "2025": "",
+    "2026": ""
+  },
+  "fallback_store": "",
+  "fallback_version": "2025",
+  "validation": {
+    "gate_enabled": true,
+    "auto_fix_enabled": true,
+    "auto_fix_max_attempts": 2,
+    "verify_stage_enabled": false,
+    "enable_api_xml_hints": true,
+    "rollout_phase": "phase3"
+  },
+  "_comment": "RAG (Gemini fileSearch) is temporarily disabled in this OSS release. Only claude_api_key is required. Copy this file to rag_config.json and fill in your Anthropic API key. Get one at https://console.anthropic.com/"
+}

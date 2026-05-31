@@ -1,0 +1,3922 @@
+// Copyright (c) 2026 SquareZero Inc. â€” Licensed under Apache 2.0. See LICENSE in the repo root.
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Controls;
+using Autodesk.Revit.UI;
+using Microsoft.Web.WebView2.Wpf;
+
+namespace Bibim.Core
+{
+    /// <summary>
+    /// Dockable panel hosting WebView2 for the React frontend.
+    /// Implements IDockablePaneProvider for Revit docking.
+    /// See design doc §1 — Architecture Diagram.
+    /// 
+    /// Chat flow uses LlmOrchestrationService (Anthropic SDK streaming)
+    /// instead of raw HTTP calls. Bridge events:
+    ///   streaming_delta  ? partial text tokens (real-time)
+    ///   streaming_end    ? final message with token usage
+    /// </summary>
+    public class BibimDockablePanelProvider : IDockablePaneProvider, IDisposable
+    {
+        private WebView2 _webView;
+        private Grid _hostGrid;
+        private WebView2Bridge _bridge;
+        private bool _initialized;
+
+        // LLM service — lazy-initialized on first message
+        private LlmOrchestrationService _llmService;
+        // Planner uses a dedicated lightweight instance (non-streaming, no bridge events)
+        private LlmOrchestrationService _plannerLlmService;
+        private readonly List<ChatMessage> _chatHistory = new List<ChatMessage>();
+        private readonly object _chatHistoryLock = new object();
+        private CancellationTokenSource _streamingCts;
+        private static readonly System.Net.Http.HttpClient _downloadHttpClient = new System.Net.Http.HttpClient();
+        // Sliding window: pass at most this many message turns to the LLM (oldest dropped)
+        private const int ChatHistoryMaxTurns = BibimConstants.ChatHistoryMaxTurns;
+
+        // Session management
+        private LocalSessionManager _sessionManager;
+        private CodeLibraryService _codeLibrary;
+        private string _activeSessionId;
+        private SessionContext _sessionContext;
+
+        // Last code generation result — needed for execute (dryrun/commit).
+        // Accessed from both UI thread and background task threads.
+        // Property wraps lock so all call sites remain unchanged.
+        private CodeGenerationResult _lastCodeGenResultValue;
+        private readonly object _lastCodeGenResultLock = new object();
+        private CodeGenerationResult _lastCodeGenResult
+        {
+            get { lock (_lastCodeGenResultLock) return _lastCodeGenResultValue; }
+            set { lock (_lastCodeGenResultLock) _lastCodeGenResultValue = value; }
+        }
+        private LastAppliedAction _lastAppliedAction;
+        private List<string> _lastRevitWarnings;
+        private readonly Dictionary<string, LastAppliedAction> _messageActions =
+            new Dictionary<string, LastAppliedAction>();
+
+        // Revit context provider — resolves @context tags to live Revit data
+        private RevitContextProvider _contextProvider;
+
+        // Roslyn analyzer — Bibim001-005 custom analyzers
+        private readonly RoslynAnalyzerService _analyzerService = new RoslynAnalyzerService();
+        private const int PlannerContextWindow = BibimConstants.PlannerContextWindow;
+        private int _suppressStreamingDeltaCount;
+        private string _pendingLibrarySnippetId;
+
+        private class LastAppliedAction
+        {
+            public string ActionId { get; set; }
+            public string TaskId { get; set; }
+            public bool CanUndo { get; set; }
+            public string FeedbackState { get; set; }
+            public string TargetDocumentTitle { get; set; }
+            public string TargetDocumentPath { get; set; }
+            public long DocumentChangeSequence { get; set; }
+            public string LibrarySnippetId { get; set; }
+        }
+
+        /// <summary>
+        /// The WPF element Revit will host in the dockable pane.
+        /// </summary>
+        public FrameworkElement HostElement => _hostGrid;
+
+        /// <summary>
+        /// Bridge for C# ? WebView2 bidirectional messaging.
+        /// </summary>
+        public WebView2Bridge Bridge => _bridge;
+
+        public void SetupDockablePane(DockablePaneProviderData data)
+        {
+            _hostGrid = new Grid();
+
+            _webView = new WebView2
+            {
+                HorizontalAlignment = HorizontalAlignment.Stretch,
+                VerticalAlignment = VerticalAlignment.Stretch
+            };
+
+            _hostGrid.Children.Add(_webView);
+
+            data.FrameworkElement = _hostGrid;
+            data.InitialState = new DockablePaneState
+            {
+                DockPosition = DockPosition.Right,
+                TabBehind = DockablePanes.BuiltInDockablePanes.ProjectBrowser
+            };
+
+            // Initialize WebView2 asynchronously after panel is set up
+            _ = InitializeWebViewAsync();
+        }
+
+        private async Task InitializeWebViewAsync()
+        {
+            if (_initialized) return;
+
+            try
+            {
+                // WebView2 user data folder — avoid conflicts with other add-ins
+                string userDataFolder = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "Bibim", "WebView2");
+
+                var env = await Microsoft.Web.WebView2.Core.CoreWebView2Environment
+                    .CreateAsync(null, userDataFolder);
+
+                await _webView.EnsureCoreWebView2Async(env);
+
+                // Set up the C# ? JS bridge
+                _bridge = new WebView2Bridge(_webView);
+                _bridge.Initialize();
+                RegisterBridgeHandlers();
+
+                // Subscribe to background version check completion.
+                // PostMessage is dispatcher-safe so firing from background thread is fine.
+                BibimApp.VersionCheckCompleted += OnVersionCheckCompleted;
+                // If the check already finished before we subscribed, push immediately.
+                var pendingUpdate = BibimApp.LastVersionCheckResult;
+                if (pendingUpdate != null)
+                    SendUpdateInfo(pendingUpdate);
+
+                // Initialize session manager. The frontend requests bootstrap state
+                // after its bridge handlers are registered, which is more reliable
+                // than sending messages before the page has loaded.
+                _sessionManager = new LocalSessionManager();
+                _sessionManager.EnsureStorageFolder();
+                _codeLibrary = new CodeLibraryService();
+
+                // Navigate to the React frontend
+                string assemblyDir = Path.GetDirectoryName(
+                    Assembly.GetExecutingAssembly().Location) ?? "";
+                string indexPath = Path.Combine(assemblyDir, "wwwroot", "index.html");
+
+                Logger.Log("BibimDockablePanel", $"Assembly dir: {assemblyDir}");
+                Logger.Log("BibimDockablePanel", $"index.html exists: {File.Exists(indexPath)}");
+
+                if (File.Exists(indexPath))
+                {
+                    // Use SetVirtualHostNameToFolderMapping for proper local file access
+                    string wwwrootDir = Path.Combine(assemblyDir, "wwwroot");
+                    _webView.CoreWebView2.SetVirtualHostNameToFolderMapping(
+                        "Bibim.local", wwwrootDir,
+                        Microsoft.Web.WebView2.Core.CoreWebView2HostResourceAccessKind.Allow);
+                    _webView.CoreWebView2.Navigate("https://Bibim.local/index.html");
+                    Logger.Log("BibimDockablePanel", "Navigating via virtual host: https://Bibim.local/index.html");
+                }
+                else
+                {
+                    _webView.CoreWebView2.NavigateToString(GetPlaceholderHtml());
+                    Logger.Log("BibimDockablePanel", "Using placeholder HTML");
+                }
+
+                _initialized = true;
+                Logger.Log("BibimDockablePanel", "WebView2 initialized successfully");
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError("BibimDockablePanel", ex);
+
+                // Show error in the panel
+                var errorBlock = new TextBlock
+                {
+                    Text = $"WebView2 initialization failed:\n{ex.Message}\n\nPlease ensure WebView2 Runtime is installed.",
+                    TextWrapping = TextWrapping.Wrap,
+                    Margin = new Thickness(16),
+                    VerticalAlignment = VerticalAlignment.Center
+                };
+                _hostGrid.Children.Clear();
+                _hostGrid.Children.Add(errorBlock);
+            }
+        }
+
+        private string GetPlaceholderHtml()
+        {
+            return @"<!DOCTYPE html>
+<html>
+<head>
+<meta charset='utf-8'>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: #0f1117;
+    color: #e4e4e7;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 100vh;
+    padding: 24px;
+  }
+  .container { text-align: center; max-width: 400px; }
+  h1 { font-size: 20px; font-weight: 600; margin-bottom: 8px; color: #818cf8; }
+  p { font-size: 14px; color: #a1a1aa; line-height: 1.6; }
+  .status { margin-top: 24px; padding: 12px; background: #1e1e2e; border-radius: 8px; font-size: 12px; color: #6366f1; }
+</style>
+</head>
+<body>
+<div class='container'>
+  <h1>Bibim v" + BibimApp.AppVersion + @"</h1>
+  <p>React frontend is not built yet.<br>Run <code>npm run build</code> in the frontend directory.</p>
+  <div class='status'>Phase 1 — Boilerplate Ready</div>
+</div>
+</body>
+</html>";
+        }
+
+        public void Dispose()
+        {
+            try
+            {
+                BibimApp.VersionCheckCompleted -= OnVersionCheckCompleted;
+                _streamingCts?.Cancel();
+                _streamingCts?.Dispose();
+                _bridge?.Dispose();
+                _webView?.Dispose();
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// Atomically replaces _streamingCts and cancels/disposes the old one.
+        /// Returns a CancellationToken from the new source.
+        /// Using Interlocked.Exchange prevents a race between UI-thread replacement
+        /// and any background thread that reads the field directly.
+        /// </summary>
+        private CancellationToken ReplaceCts()
+        {
+            var newCts = new CancellationTokenSource();
+            var old = Interlocked.Exchange(ref _streamingCts, newCts);
+            old?.Cancel();
+            old?.Dispose();
+            return newCts.Token;
+        }
+
+        private string UiText(string english, string korean)
+        {
+            return AppLanguage.IsEnglish ? english : korean;
+        }
+
+        private void EnsureActiveSession(bool createIfMissing = true)
+        {
+            if (_sessionManager == null)
+                return;
+
+            if (string.IsNullOrEmpty(_activeSessionId))
+            {
+                if (!createIfMissing)
+                    return;
+
+                var session = _sessionManager.CreateSession();
+                _activeSessionId = session.SessionId;
+
+                SendActiveSession();
+            }
+
+            if (_sessionContext == null || _sessionContext.SessionId != _activeSessionId)
+            {
+                _sessionContext = _sessionManager.LoadSessionContext(_activeSessionId)
+                    ?? new SessionContext { SessionId = _activeSessionId };
+                _sessionContext.Tasks = _sessionContext.Tasks ?? new List<TaskState>();
+            }
+        }
+
+        private void SaveSessionContext()
+        {
+            if (_sessionManager == null || _sessionContext == null || string.IsNullOrEmpty(_activeSessionId))
+                return;
+
+            _sessionContext.SessionId = _activeSessionId;
+            _sessionContext.LastUpdated = DateTime.UtcNow;
+            _sessionManager.SaveSessionContext(_sessionContext);
+        }
+
+        private List<TaskState> GetTasks()
+        {
+            EnsureActiveSession(false);
+            return _sessionContext?.Tasks ?? new List<TaskState>();
+        }
+
+        private TaskState GetActiveTask()
+        {
+            EnsureActiveSession(false);
+            if (_sessionContext == null || string.IsNullOrEmpty(_sessionContext.ActiveTaskId))
+                return null;
+
+            return _sessionContext.Tasks?.FirstOrDefault(t => t.TaskId == _sessionContext.ActiveTaskId);
+        }
+
+        private TaskState FindTask(string taskId)
+        {
+            EnsureActiveSession(false);
+            if (_sessionContext?.Tasks == null || string.IsNullOrWhiteSpace(taskId))
+                return null;
+
+            return _sessionContext.Tasks.FirstOrDefault(t => t.TaskId == taskId);
+        }
+
+        private bool IsTaskTerminal(TaskState task)
+        {
+            return task != null &&
+                (task.Stage == TaskStages.Completed || task.Stage == TaskStages.Cancelled);
+        }
+
+        private void UpsertTask(TaskState task, bool autoOpen = false)
+        {
+            if (task == null)
+                return;
+
+            EnsureActiveSession();
+
+            var tasks = _sessionContext.Tasks ?? (_sessionContext.Tasks = new List<TaskState>());
+            int index = tasks.FindIndex(t => t.TaskId == task.TaskId);
+            task.AutoOpen = autoOpen;
+            task.UpdatedAt = DateTime.UtcNow;
+
+            if (index >= 0)
+                tasks[index] = task;
+            else
+                tasks.Add(task);
+
+            _sessionContext.ActiveTaskId = task.TaskId;
+            SaveSessionContext();
+            SendTaskState();
+            SendTaskList();
+        }
+
+        private void SendTaskState()
+        {
+            try
+            {
+                var task = GetActiveTask();
+                _bridge?.PostMessage("task_state", ToTaskPayload(task));
+                if (task != null && task.AutoOpen)
+                {
+                    task.AutoOpen = false;
+                    SaveSessionContext();
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError("SendTaskState", ex);
+            }
+        }
+
+        private void SendTaskList()
+        {
+            try
+            {
+                var tasks = GetTasks()
+                    .OrderByDescending(t => t.UpdatedAt)
+                    .Select(t => new
+                    {
+                        taskId = t.TaskId,
+                        title = t.Title ?? "",
+                        summary = t.Summary ?? "",
+                        kind = t.Kind ?? TaskKinds.Write,
+                        stage = t.Stage ?? TaskStages.NeedsDetails,
+                        requiresApply = t.RequiresApply,
+                        wasApplied = t.WasApplied,
+                        questionCount = t.Questions?.Count ?? 0,
+                        updatedAt = t.UpdatedAt.ToString("o"),
+                    })
+                    .ToArray();
+
+                _bridge?.PostMessage("task_list", tasks);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError("SendTaskList", ex);
+            }
+        }
+
+        private object ToTaskPayload(TaskState task)
+        {
+            if (task == null)
+                return null;
+
+            bool hasError = DetectResultError(task);
+
+            return new
+            {
+                taskId = task.TaskId,
+                title = task.Title ?? "",
+                summary = task.Summary ?? "",
+                kind = task.Kind ?? TaskKinds.Write,
+                stage = task.Stage ?? TaskStages.NeedsDetails,
+                requiresApply = task.RequiresApply,
+                wasApplied = task.WasApplied,
+                autoOpen = task.AutoOpen,
+                hasError,
+                steps = (task.Steps ?? new List<string>()).ToArray(),
+                questions = (task.Questions ?? new List<QuestionItem>()).Select(q => new
+                {
+                    id = q.Id,
+                    text = q.Text,
+                    selectionType = q.SelectionType ?? "single",
+                    options = (q.Options ?? new List<string>()).ToArray(),
+                    answer = q.Answer,
+                    skipped = q.Skipped,
+                }).ToArray(),
+                resultSummary = task.ResultSummary ?? "",
+                createdAt = task.CreatedAt.ToString("o"),
+                updatedAt = task.UpdatedAt.ToString("o"),
+                review = task.Review == null ? null : new
+                {
+                    safeCount = task.Review.SafeCount,
+                    versionSpecificCount = task.Review.VersionSpecificCount,
+                    deprecatedCount = task.Review.DeprecatedCount,
+                    affectedElementCount = task.Review.AffectedElementCount,
+                    previewSuccess = task.Review.PreviewSuccess,
+                    previewError = task.Review.PreviewError,
+                    executionSummary = task.Review.ExecutionSummary,
+                    analyzerDiagnostics = task.Review.AnalyzerDiagnostics?.Select(d => new
+                    {
+                        id = d.Id,
+                        message = d.Message,
+                        severity = d.Severity,
+                        line = d.Line
+                    })
+                }
+            };
+        }
+
+        /// <summary>
+        /// Returns true if the completed task ended with an execution failure.
+        /// Uses the ExecutionSuccess flag set at runtime (not text-based regex) to
+        /// avoid false positives when code output legitimately contains words like "error".
+        /// </summary>
+        private static bool DetectResultError(TaskState task)
+        {
+            if (task == null || task.Stage != TaskStages.Completed)
+                return false;
+            return !task.ExecutionSuccess;
+        }
+
+        private TaskState CreateTask(TaskPlanResponse plan, string userText)
+        {
+            return new TaskState
+            {
+                TaskId = Guid.NewGuid().ToString(),
+                Title = string.IsNullOrWhiteSpace(plan.Title)
+                    ? _sessionManager?.GenerateTitle(userText) ?? UiText("Untitled task", "?? ?? ??")
+                    : plan.Title,
+                Summary = plan.Summary ?? "",
+                Kind = string.Equals(plan.TaskKind, TaskKinds.Read, StringComparison.OrdinalIgnoreCase)
+                    ? TaskKinds.Read
+                    : TaskKinds.Write,
+                RequiresApply = !string.Equals(plan.TaskKind, TaskKinds.Read, StringComparison.OrdinalIgnoreCase),
+                Stage = TaskStages.NeedsDetails,
+                Steps = plan.Steps?.Where(s => !string.IsNullOrWhiteSpace(s)).ToList() ?? new List<string>(),
+                Questions = plan.Questions?.Where(q => !string.IsNullOrWhiteSpace(q.Text)).ToList() ?? new List<QuestionItem>(),
+                SourceUserMessage = userText,
+                CollectedInputs = new List<string> { userText },
+                CreatedAt = DateTime.UtcNow,
+                UpdatedAt = DateTime.UtcNow
+            };
+        }
+
+        private static bool ContainsAny(string text, params string[] terms)
+        {
+            if (string.IsNullOrWhiteSpace(text) || terms == null || terms.Length == 0)
+                return false;
+
+            return terms.Any(term =>
+                !string.IsNullOrWhiteSpace(term) &&
+                text.IndexOf(term, StringComparison.OrdinalIgnoreCase) >= 0);
+        }
+
+        private string BuildTaskSearchText(TaskState task)
+        {
+            if (task == null)
+                return string.Empty;
+
+            return string.Join("\n", new[]
+            {
+                task.Title,
+                task.Summary,
+                task.SourceUserMessage,
+                string.Join(" ", task.CollectedInputs ?? new List<string>()),
+                string.Join(" ", task.Steps ?? new List<string>()),
+            }).ToLowerInvariant();
+        }
+
+        /// <summary>
+        /// Build search text scoped to the CURRENT turn only.
+        /// Used by guards (e.g. ApplyParameterCreationGuard) to avoid
+        /// false positives from stale CollectedInputs accumulated in prior turns.
+        /// </summary>
+        private string BuildCurrentTurnSearchText(TaskState task)
+        {
+            if (task == null)
+                return string.Empty;
+
+            return string.Join("\n", new[]
+            {
+                task.Title,
+                task.Summary,
+                task.SourceUserMessage,
+                string.Join(" ", task.Steps ?? new List<string>()),
+            }).ToLowerInvariant();
+        }
+
+        private void AppendTaskUserInput(TaskState task, string userText)
+        {
+            if (task == null || string.IsNullOrWhiteSpace(userText))
+                return;
+
+            if (task.CollectedInputs == null)
+                task.CollectedInputs = new List<string>();
+
+            task.CollectedInputs.Add(userText.Trim());
+            if (task.CollectedInputs.Count > 12)
+                task.CollectedInputs = task.CollectedInputs.Skip(task.CollectedInputs.Count - 12).ToList();
+        }
+
+        private void ApplyPlanToTask(TaskState task, TaskPlanResponse plan, string userText)
+        {
+            if (task == null || plan == null)
+                return;
+
+            task.Title = string.IsNullOrWhiteSpace(plan.Title)
+                ? task.Title
+                : plan.Title;
+            task.Summary = string.IsNullOrWhiteSpace(plan.Summary)
+                ? task.Summary
+                : plan.Summary;
+            task.Kind = string.Equals(plan.TaskKind, TaskKinds.Read, StringComparison.OrdinalIgnoreCase)
+                ? TaskKinds.Read
+                : TaskKinds.Write;
+            task.RequiresApply = task.Kind != TaskKinds.Read;
+            task.Steps = plan.Steps?.Where(s => !string.IsNullOrWhiteSpace(s)).ToList() ?? new List<string>();
+            task.Questions = plan.Questions?.Where(q => !string.IsNullOrWhiteSpace(q.Text)).ToList() ?? new List<QuestionItem>();
+            task.SourceUserMessage = userText;
+            task.ResultSummary = null;
+            task.Review = null;
+            task.GeneratedCode = null;
+            task.WasApplied = false;
+        }
+
+        private void ApplyCurrentContextSummaryDefaults(TaskState task)
+        {
+            if (task == null)
+                return;
+
+            task.Kind = TaskKinds.Read;
+            task.RequiresApply = false;
+            task.WasApplied = false;
+            task.Questions = new List<QuestionItem>();
+            task.Title = UiText("Current model and view analysis", "?? ?? ? ? ??");
+            task.Summary = UiText(
+                "I will inspect the open Revit model and the active view, then summarize the available document, view, category, and selection information.",
+                "?? ?? Revit ??? ?? ?? ??? ?, ?? ??? ? ??, ?? ????, ?? ?? ??? ?????.");
+            task.Steps = new List<string>
+            {
+                UiText("Document information", "?? ??"),
+                UiText("Active view information", "?? ? ??"),
+                UiText("Levels, phases, and worksets", "?? / ??? / ???"),
+                UiText("Major visible categories in the current view", "?? ?? ?? ????"),
+                UiText("Current selection state", "?? ?? ??")
+            };
+        }
+
+        private bool ApplyParameterCreationGuard(TaskState task)
+        {
+            if (task == null || task.Kind != TaskKinds.Write)
+                return false;
+
+            // Use current-turn-only text to avoid contamination from prior CollectedInputs
+            string text = BuildCurrentTurnSearchText(task);
+
+            // Also check CollectedInputs for answers already provided in THIS task
+            string fullText = BuildTaskSearchText(task);
+
+            bool isParameterCreation = ContainsAny(text, "????", "parameter") &&
+                ContainsAny(text, "??", "??", "??", "???", "add", "create", "new");
+
+            if (!isParameterCreation)
+                return false;
+
+            // Detect delegation expressions — user wants us to decide
+            if (IsDelegationExpression(task.SourceUserMessage))
+                return false;
+
+            var questions = new List<QuestionItem>();
+            bool hasType = ContainsAny(fullText,
+                "yes/no", "yes no", "checkbox", "check box", "????", "bool", "boolean", "?/???",
+                "???", "text", "??", "number", "??", "length", "??", "angle");
+            bool hasReusePolicy = ContainsAny(fullText,
+                "reuse", "overwrite", "existing", "??", "???", "?? ?", "???", "stop with warning");
+            bool hasBindingScope = ContainsAny(fullText,
+                "????", "category", "categories", "???", "binding",
+                "selected categories", "??? ?? ????", "?? ?? ????");
+            bool hasGroup = ContainsAny(fullText,
+                "identity data", "parameter group", "group", "id data", "other",
+                "???? ??", "??", "???? ??", "???", "data");
+
+            if (!hasBindingScope)
+            {
+                questions.Add(new QuestionItem
+                {
+                    Text = UiText(
+                        "How should the new parameter be bound?",
+                        "? ????? ??? ???????"),
+                    SelectionType = "single",
+                    Options = new List<string>
+                    {
+                        UiText("Bind to categories of current selection", "?? ?? ???? ????? ???"),
+                        UiText("Bind to specific categories I choose", "?? ??? ?? ????? ???"),
+                    }
+                });
+            }
+
+            if (!hasGroup)
+            {
+                questions.Add(new QuestionItem
+                {
+                    Text = UiText(
+                        "Which parameter group in the Properties palette?",
+                        "?? ??? ?? ???? ??? ??? ????"),
+                    SelectionType = "single",
+                    Options = new List<string>
+                    {
+                        UiText("Identity Data", "ID ???"),
+                        UiText("Data", "???"),
+                        UiText("Other", "??"),
+                    }
+                });
+            }
+
+            if (!hasType)
+            {
+                questions.Add(new QuestionItem
+                {
+                    Text = UiText(
+                        "What parameter type should I create?",
+                        "?? ???? ???? ?????"),
+                    SelectionType = "single",
+                    Options = new List<string>
+                    {
+                        UiText("Text", "???"),
+                        UiText("Number", "??"),
+                        UiText("Length", "??"),
+                        UiText("Yes/No", "?/???"),
+                        UiText("Angle", "??"),
+                    }
+                });
+            }
+
+            if (!hasReusePolicy)
+            {
+                questions.Add(new QuestionItem
+                {
+                    Text = UiText(
+                        "If a parameter with the same name already exists?",
+                        "?? ??? ????? ?? ????"),
+                    SelectionType = "single",
+                    Options = new List<string>
+                    {
+                        UiText("Reuse it and set values on current selection", "????? ?? ?? ??? ? ??"),
+                        UiText("Stop with a warning", "??? ?? ??"),
+                    }
+                });
+            }
+
+            if (questions.Count == 0)
+                return false;
+
+            task.Title = UiText("Add parameter to selected elements", "?? ?? ???? ??");
+            task.Summary = UiText(
+                "This task needs Revit-specific parameter binding details before code generation can proceed.",
+                "? ??? ?? ??? ???? ?? Revit ???? ??? ?? ?? ??? ? ?????.");
+            task.Questions = questions;
+            task.RequiresApply = true;
+            return true;
+        }
+
+        /// <summary>
+        /// Detect Korean/English delegation expressions where the user wants
+        /// the AI to decide on its own (e.g. "????", "????", "default?").
+        /// When detected, guards should skip clarification and use sensible defaults.
+        /// </summary>
+        private static bool IsDelegationExpression(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+                return false;
+
+            return ContainsAny(text,
+                "???", "????", "????", "????", "?? ??",
+                "?? ??", "default?", "????", "?????", "????",
+                "??? ?", "??????", "??? ???", "?? ?",
+                "just do it", "your choice", "you decide", "don't care",
+                "whatever", "any is fine");
+        }
+
+        private string BuildTaskQuestionsMessage(TaskState task)
+        {
+            string intro = UiText(
+                "I need a few details before I continue:",
+                "?? ????? ?? ??? ?? ???? ???:");
+            string questions = string.Join(Environment.NewLine,
+                (task.Questions ?? new List<QuestionItem>())
+                    .Select((q, index) => $"{index + 1}. {q.Text}"));
+            return string.IsNullOrWhiteSpace(questions) ? intro : $"{intro}{Environment.NewLine}{questions}";
+        }
+
+        private bool IsBroadReadReviewTask(TaskState task)
+        {
+            if (task == null || task.Kind != TaskKinds.Read)
+                return false;
+
+            if (IsBuiltInCurrentContextSummaryTaskV2(task))
+                return true;
+
+            string text = BuildTaskSearchText(task);
+            bool broadWords = ContainsAny(text,
+                "??? ??", "???", "??", "??", "??", "??",
+                "as much as possible", "in detail", "detailed", "comprehensive", "everything", "all possible");
+            bool readWords = ContainsAny(text,
+                "??", "??", "??", "??", "??", "??",
+                "describe", "summary", "summarize", "analyze", "report", "show");
+            return broadWords && readWords;
+        }
+
+        private string BuildReadTaskReviewMessage(TaskState task)
+        {
+            if (task == null)
+                return string.Empty;
+
+            string intro = UiText(
+                "I can analyze the current Revit context with the following scope:",
+                "?? ??? ?? Revit ??? ?????:");
+            string stepLines = string.Join(Environment.NewLine,
+                (task.Steps ?? new List<string>()).Select(step => $"- {step}"));
+            string outro = UiText(
+                "If you want anything else included, tell me before I continue. Otherwise, press Review Task to start the analysis.",
+                "??? ??? ??? ??? ?? ??????. ??? ????? ?? ??? ?? ??? ???? ???.");
+
+            return string.IsNullOrWhiteSpace(stepLines)
+                ? $"{intro}{Environment.NewLine}{outro}"
+                : $"{intro}{Environment.NewLine}{stepLines}{Environment.NewLine}{Environment.NewLine}{outro}";
+        }
+
+        private void SendAssistantMessage(string text, string contentType = "text",
+            int inputTokens = 0, int outputTokens = 0, string csharpCode = null,
+            string messageType = "normal", long elapsedMs = 0)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+                return;
+
+            string storedContentType = !string.IsNullOrWhiteSpace(csharpCode)
+                ? "code"
+                : contentType;
+            lock (_chatHistoryLock) _chatHistory.Add(new ChatMessage { Text = text, IsUser = false });
+            _sessionManager?.AddMessage(_activeSessionId, "assistant", storedContentType,
+                text, csharpCode, inputTokens, outputTokens);
+            SendSessionList();
+
+            PostStreamingEndMessage(text, messageType, csharpCode, inputTokens, outputTokens, elapsedMs);
+
+            // Windows notification when user action may be needed
+            try { WindowsNotificationService.NotifyActionRequired(); }
+            catch (Exception ex) { Logger.Log("Notification", $"Skipped: {ex.Message}"); }
+        }
+
+        private void PostStreamingEndMessage(string text, string messageType = "normal",
+            string csharpCode = null, int inputTokens = 0, int outputTokens = 0, long elapsedMs = 0,
+            bool isUser = false, string actionId = null, string taskId = null, bool canUndo = false,
+            bool feedbackEnabled = false, string feedbackState = null, string createdAt = null)
+        {
+            _bridge?.PostMessage("streaming_end", new
+            {
+                text,
+                type = messageType,
+                csharpCode,
+                isUser,
+                inputTokens,
+                outputTokens,
+                elapsedMs,
+                actionId,
+                taskId,
+                canUndo,
+                feedbackEnabled,
+                feedbackState,
+                createdAt
+            });
+        }
+
+        private void SendMessageActionState(LastAppliedAction action)
+        {
+            if (action == null || string.IsNullOrWhiteSpace(action.ActionId))
+                return;
+
+            _bridge?.PostMessage("message_action_state", new
+            {
+                actionId = action.ActionId,
+                canUndo = action.CanUndo,
+                feedbackEnabled = true,
+                feedbackState = action.FeedbackState
+            });
+        }
+
+        private LastAppliedAction TrackAppliedAction(TaskState task)
+        {
+            if (_lastAppliedAction != null &&
+                _messageActions.TryGetValue(_lastAppliedAction.ActionId, out var previousAction) &&
+                previousAction.CanUndo)
+            {
+                previousAction.CanUndo = false;
+                SendMessageActionState(previousAction);
+            }
+
+            var action = new LastAppliedAction
+            {
+                ActionId = Guid.NewGuid().ToString("N"),
+                TaskId = task?.TaskId,
+                CanUndo = true,
+                FeedbackState = null,
+                TargetDocumentTitle = task?.TargetDocumentTitle,
+                TargetDocumentPath = task?.TargetDocumentPath,
+                DocumentChangeSequence = DocumentChangeTracker.GetCurrentSequence(
+                    task?.TargetDocumentTitle,
+                    task?.TargetDocumentPath),
+                LibrarySnippetId = _pendingLibrarySnippetId,
+            };
+            _pendingLibrarySnippetId = null;
+
+            _messageActions[action.ActionId] = action;
+            _lastAppliedAction = action;
+            return action;
+        }
+
+        private void ResetMessageActions()
+        {
+            _lastAppliedAction = null;
+            _messageActions.Clear();
+        }
+
+        private static void BindTaskToExecutedDocument(TaskState task, ExecutionResult result)
+        {
+            if (task == null || result == null)
+                return;
+
+            if (string.IsNullOrWhiteSpace(task.TargetDocumentTitle) &&
+                !string.IsNullOrWhiteSpace(result.DocumentTitle))
+            {
+                task.TargetDocumentTitle = result.DocumentTitle;
+            }
+
+            if (string.IsNullOrWhiteSpace(task.TargetDocumentPath) &&
+                !string.IsNullOrWhiteSpace(result.DocumentPath))
+            {
+                task.TargetDocumentPath = result.DocumentPath;
+            }
+        }
+
+        /// <summary>
+        /// Creates a debug snapshot of the current task state for artifact recording.
+        /// </summary>
+        private object CreateTaskDebugSnapshot(TaskState task)
+        {
+            if (task == null)
+                return null;
+
+            return new
+            {
+                task.TaskId,
+                task.Title,
+                task.Summary,
+                task.Kind,
+                task.Stage,
+                task.RequiresApply,
+                task.WasApplied,
+                task.SourceUserMessage,
+                task.CollectedInputs,
+                task.Steps,
+                task.Questions,
+                task.CreatedAt,
+                task.UpdatedAt
+            };
+        }
+
+        private async Task<ExecutionResult> UndoLastApplyAsync(LastAppliedAction action)
+        {
+            var request = new ExecutionRequest
+            {
+                Kind = ExecutionRequestKind.UndoLastApply,
+                ExpectedDocumentTitle = action?.TargetDocumentTitle,
+                ExpectedDocumentPath = action?.TargetDocumentPath,
+                Callback = new TaskCompletionSource<ExecutionResult>(
+                    TaskCreationOptions.RunContinuationsAsynchronously)
+            };
+
+            BibimApp.ExecutionHandler.Enqueue(request);
+            BibimApp.ExecutionEvent.Raise();
+            return await request.Callback.Task;
+        }
+
+        private string BuildTaskPlannerPrompt()
+        {
+            string outputLanguage = AppLanguage.IsEnglish ? "English" : "Korean";
+            string categoryChecklist = CategoryQuestionTemplates.BuildPlannerChecklist();
+            return $@"You are the Bibim task planner for a Revit add-in.
+Return JSON only. No markdown. No code fences. No explanations.
+
+Decide whether the latest user message is:
+- a direct chat/information request that should be answered immediately (`mode = ""chat""`)
+- or an actionable request that should become a task (`mode = ""task""`)
+
+Rules:
+1. Greetings, thanks, capability questions, API explanation questions, and troubleshooting explanations are `chat`.
+2. Any request to inspect, count, analyze, list, generate, modify, place, rename, delete, export, or execute something in Revit is `task`.
+3. For actionable requests, never guess missing details. If anything important is missing, fill `questions` with concrete clarifying questions and set `shouldAutoRun = false`.
+4. If there is an active task:
+   - use `taskRelation = ""update""` ONLY when the user is clearly refining or answering questions about that SAME task
+   - use `taskRelation = ""new""` when the message is a different task or a new request, even if the topic is related
+   - use `taskRelation = ""ask""` when it is ambiguous. In that case, put a short user-facing clarification in `assistantMessage`.
+   - IMPORTANT: If the user's message describes a completely different action (e.g. active task is ""add parameter"" but user says ""move family""), ALWAYS use `taskRelation = ""new""`.
+5. `taskKind = ""read""` means read-only / query / analysis task (e.g. count, list, inspect). If the request is complete, set `shouldAutoRun = true`.
+6. `taskKind = ""write""` means any change to the model or generated artifact. If the request is complete, set `shouldAutoRun = false`.
+   IMPORTANT: Export operations (PDF, DWG, DXF, CSV, IFC, Excel, image, schedule, etc.) are ALWAYS `taskKind = ""write""` and `shouldAutoRun = false`, even though they do not modify the Revit model. They create file artifacts on disk and must go through the preview ? confirm ? execute flow.
+7. Write all user-facing strings (`title`, `summary`, `questions`, `assistantMessage`) in {outputLanguage}.
+8. Keep `steps` high-level, natural-language, and free of API syntax.
+9. If the user asks about a recent execution failure (e.g. ""? ?????"", ""?? ??"", ""why did it fail""), check the [RECENT EXECUTION LOG] section and answer as `mode = ""chat""` with the failure details in `assistantMessage`.
+10. Delegation expressions like ""????"", ""????"", ""????"", ""????"", ""?? ???"", ""default?"" mean the user wants you to choose sensible defaults. Treat any pending clarification as answered and proceed.
+
+JSON schema:
+{{
+  ""mode"": ""chat"" | ""task"",
+  ""taskKind"": ""read"" | ""write"",
+  ""taskRelation"": ""new"" | ""update"" | ""ask"",
+  ""title"": ""short task title"",
+  ""summary"": ""one paragraph summary"",
+  ""steps"": [""step 1"", ""step 2""],
+  ""questions"": [
+    {{
+      ""text"": ""question text"",
+      ""selectionType"": ""single"" | ""multi"",
+      ""options"": [""option 1"", ""option 2"", ""option 3""]
+    }}
+  ],
+  ""assistantMessage"": ""direct answer for chat mode OR short clarification for taskRelation=ask"",
+  ""shouldAutoRun"": true | false
+}}
+
+Question rules:
+- Each question MUST have 2-5 concrete options the user can click.
+- Use ""single"" when only one answer makes sense, ""multi"" when multiple can apply.
+- Options should be short, clear labels (not full sentences).
+- The user can also type a custom answer, so options don't need to cover every case.
+
+{categoryChecklist}";
+        }
+
+        private string BuildPlannerInput(string userText, string resolvedText, TaskState activeTask)
+        {
+            string[] recentHistory;
+            lock (_chatHistoryLock)
+            {
+                recentHistory = _chatHistory
+                    .Skip(Math.Max(0, _chatHistory.Count - PlannerContextWindow))
+                    .Select(m =>
+                    {
+                        string text = m.Text ?? string.Empty;
+                        // Cap each turn so a single noisy turn (long code block, big
+                        // tool output) doesn't blow the planner prompt.
+                        if (text.Length > BibimConstants.PlannerHistoryTurnMaxChars)
+                            text = text.Substring(0, BibimConstants.PlannerHistoryTurnMaxChars) + "...";
+                        return $"{(m.IsUser ? "USER" : "ASSISTANT")}: {text}";
+                    })
+                    .ToArray();
+            }
+
+            string currentTask = activeTask == null || IsTaskTerminal(activeTask)
+                ? "None"
+                : JsonHelper.Serialize(new
+                {
+                    activeTask.TaskId,
+                    activeTask.Title,
+                    activeTask.Summary,
+                    activeTask.Kind,
+                    activeTask.Stage,
+                    activeTask.Steps,
+                    activeTask.Questions,
+                    // Omit CollectedInputs to prevent stale keywords from
+                    // biasing the planner toward "update" on unrelated tasks.
+                    activeTask.RequiresApply
+                }, indented: true);
+
+            string contextBlock = resolvedText != userText
+                ? resolvedText
+                : "(none)";
+
+            return $@"[LATEST USER MESSAGE]
+{userText}
+
+[RESOLVED REVIT CONTEXT]
+{contextBlock}
+
+[ACTIVE TASK]
+{currentTask}
+
+[RECENT EXECUTION LOG]
+{BuildExecutionLogContext()}
+
+[RECENT CONVERSATION]
+{string.Join(Environment.NewLine, recentHistory)}
+
+[Output format: respond with JSON only — no markdown, no commentary.]";
+        }
+
+        /// <summary>
+        /// Build a text summary of recent execution results for inclusion in
+        /// planner and codegen prompts. Enables the AI to answer questions like
+        /// "? ?????" without asking the user to re-provide error messages.
+        /// </summary>
+        private string BuildExecutionLogContext()
+        {
+            if (_sessionContext?.ExecutionLog == null || _sessionContext.ExecutionLog.Count == 0)
+                return "(no recent executions)";
+
+            var sb = new System.Text.StringBuilder();
+            foreach (var entry in _sessionContext.ExecutionLog)
+            {
+                string status = entry.Success ? "SUCCESS" : "FAILED";
+                string mode = entry.IsDryRun ? "preview" : "commit";
+                sb.AppendLine($"[{entry.Timestamp:HH:mm:ss}] {status} ({mode}) — {entry.TaskTitle ?? "unknown task"}");
+                if (!entry.Success && !string.IsNullOrWhiteSpace(entry.ErrorMessage))
+                    sb.AppendLine($"  Error: {entry.ErrorMessage}");
+                else if (entry.Success && !string.IsNullOrWhiteSpace(entry.Output))
+                {
+                    // Truncate long output to keep prompt size reasonable
+                    string output = entry.Output.Length > 200
+                        ? entry.Output.Substring(0, 200) + "..."
+                        : entry.Output;
+                    sb.AppendLine($"  Output: {output}");
+                }
+            }
+            return sb.ToString().TrimEnd();
+        }
+
+        private async Task<TaskPlanResponse> PlanUserIntentAsync(
+            string userText, string resolvedText, CancellationToken ct)
+        {
+            var planner = EnsurePlannerService();
+
+            var planningHistory = new List<ChatMessage>
+            {
+                new ChatMessage
+                {
+                    Text = BuildPlannerInput(userText, resolvedText, GetActiveTask()),
+                    IsUser = true
+                }
+            };
+
+            // First attempt — JSON-only output mode (Gemini / OpenAI native flag,
+            // Anthropic falls back to prompt instruction).
+            var response = await planner.SendMessageNonStreamingAsync(
+                planningHistory, BuildTaskPlannerPrompt(),
+                maxTokens: 1024, ct: ct, jsonMode: true);
+            if (!response.Success || string.IsNullOrWhiteSpace(response.Text))
+                throw new InvalidOperationException(response.ErrorMessage ?? "Task planner failed.");
+
+            // Parse with one retry on failure — Gemini occasionally truncates JSON
+            // mid-array even with native JSON mode, and stronger instruction usually
+            // recovers it on the second try.
+            TaskPlanResponse plan = TryParsePlan(response.Text, out string parseError);
+            if (plan == null)
+            {
+                Logger.Log("TaskPlanner",
+                    $"First parse failed ({parseError}); retrying with explicit JSON-only nudge");
+
+                var retryHistory = new List<ChatMessage>(planningHistory)
+                {
+                    new ChatMessage { Text = response.Text, IsUser = false },
+                    new ChatMessage
+                    {
+                        Text = "Your previous response was not valid JSON (parse error: " +
+                               parseError + "). " +
+                               "Return ONLY a single complete JSON object that matches the schema. " +
+                               "Do NOT use markdown. Do NOT use code fences. " +
+                               "Do NOT add any commentary before or after the JSON.",
+                        IsUser = true
+                    }
+                };
+
+                var retryResponse = await planner.SendMessageNonStreamingAsync(
+                    retryHistory, BuildTaskPlannerPrompt(),
+                    maxTokens: 1024, ct: ct, jsonMode: true);
+                if (!retryResponse.Success || string.IsNullOrWhiteSpace(retryResponse.Text))
+                    throw new InvalidOperationException(parseError);
+
+                plan = TryParsePlan(retryResponse.Text, out string retryError);
+                if (plan == null)
+                {
+                    Logger.Log("TaskPlanner", $"Retry parse also failed: {retryError}");
+                    throw new InvalidOperationException(retryError);
+                }
+            }
+
+            return plan;
+        }
+
+        /// <summary>
+        /// Try to extract + deserialize a TaskPlanResponse from raw model output.
+        /// Returns null with errorMessage set on failure so the caller can decide
+        /// whether to retry. Also normalises the questions array (string-form
+        /// fallback for older outputs).
+        /// </summary>
+        private TaskPlanResponse TryParsePlan(string rawText, out string errorMessage)
+        {
+            errorMessage = null;
+            string json = ExtractJsonObject(rawText);
+            if (string.IsNullOrWhiteSpace(json))
+            {
+                errorMessage = "Task planner returned non-JSON content.";
+                return null;
+            }
+
+            TaskPlanResponse plan;
+            try
+            {
+                plan = JsonHelper.Deserialize<TaskPlanResponse>(json);
+            }
+            catch (Exception ex)
+            {
+                errorMessage = ex.Message;
+                return null;
+            }
+
+            if (plan == null || string.IsNullOrWhiteSpace(plan.Mode))
+            {
+                errorMessage = "Task planner returned an invalid payload.";
+                return null;
+            }
+
+            // Backward compatibility: questions may come back as plain strings or
+            // as QuestionItem objects with partial fields. Normalize manually so
+            // downstream UI always gets a clean list.
+            try
+            {
+                var jObj = Newtonsoft.Json.Linq.JObject.Parse(json);
+                var questionsToken = jObj["questions"];
+                if (questionsToken is Newtonsoft.Json.Linq.JArray questionsArray && questionsArray.Count > 0)
+                {
+                    var normalized = new List<QuestionItem>();
+                    foreach (var item in questionsArray)
+                    {
+                        if (item.Type == Newtonsoft.Json.Linq.JTokenType.String)
+                        {
+                            normalized.Add(new QuestionItem
+                            {
+                                Text = item.ToString(),
+                                SelectionType = "single",
+                                Options = new List<string>()
+                            });
+                        }
+                        else if (item.Type == Newtonsoft.Json.Linq.JTokenType.Object)
+                        {
+                            var qi = item.ToObject<QuestionItem>();
+                            if (qi != null && !string.IsNullOrWhiteSpace(qi.Text))
+                            {
+                                if (qi.Options == null) qi.Options = new List<string>();
+                                if (string.IsNullOrWhiteSpace(qi.SelectionType)) qi.SelectionType = "single";
+                                normalized.Add(qi);
+                            }
+                        }
+                    }
+                    plan.Questions = normalized;
+                }
+            }
+            catch (Exception parseEx)
+            {
+                Logger.Log("TaskPlanner", $"Questions normalization fallback: {parseEx.Message}");
+            }
+
+            return plan;
+        }
+
+        private string ExtractJsonObject(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+                return null;
+
+            // Gemini sometimes wraps JSON in markdown fences despite responseMimeType=application/json
+            text = Regex.Replace(text, @"^\s*```(?:json)?\s*\n?", "", RegexOptions.Multiline);
+            text = Regex.Replace(text, @"\n?\s*```\s*$", "", RegexOptions.Multiline);
+            text = text.Trim();
+
+            var match = Regex.Match(text, "\\{[\\s\\S]*\\}");
+            return match.Success ? match.Value : null;
+        }
+
+        private string ToCSharpLiteral(string value)
+        {
+            return Newtonsoft.Json.JsonConvert.ToString(value ?? string.Empty);
+        }
+
+        private bool IsBuiltInCurrentContextSummaryTask(TaskState task)
+        {
+            if (task == null)
+                return false;
+
+            string text = BuildTaskSearchText(task);
+
+            bool mentionsCurrentContext =
+                text.Contains("?? ?") ||
+                text.Contains("?? ?") ||
+                text.Contains("???? ??") ||
+                text.Contains("?? ?? ??") ||
+                text.Contains("?? ??") ||
+                text.Contains("open model") ||
+                text.Contains("current model") ||
+                text.Contains("active view") ||
+                text.Contains("current view");
+
+            bool asksForDescription =
+                text.Contains("??") ||
+                text.Contains("??") ||
+                text.Contains("??") ||
+                text.Contains("??") ||
+                text.Contains("??? ??") ||
+                text.Contains("describe") ||
+                text.Contains("summary") ||
+                text.Contains("analyze") ||
+                text.Contains("tell me");
+
+            return mentionsCurrentContext && asksForDescription;
+        }
+
+        private bool IsBuiltInCurrentContextSummaryTaskV2(TaskState task)
+        {
+            if (task == null)
+                return false;
+
+            string text = BuildTaskSearchText(task);
+
+            bool mentionsCurrentContext = ContainsAny(text,
+                "?? ?", "?? ?", "???? ??", "?? ?? ??", "?? ??",
+                "open model", "current model", "active view", "current view");
+
+            bool asksForDescription = ContainsAny(text,
+                "??", "??", "??", "??", "??? ??",
+                "describe", "summary", "summarize", "analyze", "tell me");
+
+            return mentionsCurrentContext && asksForDescription;
+        }
+
+        private string BuildCurrentContextSummaryCode()
+        {
+            string intro = ToCSharpLiteral(UiText(
+                "I analyzed the currently open Revit model and active view.",
+                "?? ?? ?? Revit ??? ?? ?? ??????."));
+            string modelHeader = ToCSharpLiteral(UiText("Model Summary", "?? ??"));
+            string viewHeader = ToCSharpLiteral(UiText("Current View", "?? ?"));
+            string selectionHeader = ToCSharpLiteral(UiText("Selection", "?? ??"));
+            string docName = ToCSharpLiteral(UiText("Document", "???"));
+            string docPath = ToCSharpLiteral(UiText("Path", "?? ??"));
+            string familyDoc = ToCSharpLiteral(UiText("Family document", "??? ??"));
+            string workshared = ToCSharpLiteral(UiText("Workshared", "??? ??"));
+            string levels = ToCSharpLiteral(UiText("Levels", "?? ?"));
+            string phases = ToCSharpLiteral(UiText("Phases", "??? ?"));
+            string worksets = ToCSharpLiteral(UiText("User worksets", "??? ??? ?"));
+            string totalElements = ToCSharpLiteral(UiText("Model elements", "??? ?? ?"));
+            string viewName = ToCSharpLiteral(UiText("Name", "??"));
+            string viewType = ToCSharpLiteral(UiText("Type", "??"));
+            string viewScale = ToCSharpLiteral(UiText("Scale", "??"));
+            string detailLevel = ToCSharpLiteral(UiText("Detail level", "?? ??"));
+            string viewTemplate = ToCSharpLiteral(UiText("View template", "? ???"));
+            string viewElements = ToCSharpLiteral(UiText("Visible non-type elements", "?? ?? ??? ?? ?"));
+            string visibleCategories = ToCSharpLiteral(UiText("Visible categories", "??? ?? ????"));
+            string selectedCount = ToCSharpLiteral(UiText("Selected elements", "?? ?? ?"));
+            string selectedCategories = ToCSharpLiteral(UiText("Selected categories", "?? ?? ????"));
+            string yesText = ToCSharpLiteral(UiText("Yes", "?"));
+            string noText = ToCSharpLiteral(UiText("No", "???"));
+            string noneText = ToCSharpLiteral(UiText("None", "??"));
+
+            return $@"using System;
+using System.Linq;
+using System.Text;
+using System.Collections.Generic;
+using Autodesk.Revit.DB;
+using Autodesk.Revit.UI;
+
+namespace BibimGenerated
+{{
+    public static class Program
+    {{
+        public static object Execute(UIApplication uiApp, Bibim.Core.BibimExecutionContext ctx)
+        {{
+            var uidoc = uiApp?.ActiveUIDocument;
+            var doc = uidoc?.Document;
+            if (doc == null)
+                return {ToCSharpLiteral(UiText("No active document.", "?? ??? ????."))};
+
+            var sb = new StringBuilder();
+            sb.AppendLine({intro});
+            sb.AppendLine();
+            sb.AppendLine(""["" + {modelHeader} + ""]"");
+            sb.AppendLine($""- {{{docName}}}: {{doc.Title}}"");
+            if (!string.IsNullOrWhiteSpace(doc.PathName))
+                sb.AppendLine($""- {{{docPath}}}: {{doc.PathName}}"");
+            sb.AppendLine($""- {{{familyDoc}}}: {{(doc.IsFamilyDocument ? {yesText} : {noText})}}"");
+            sb.AppendLine($""- {{{workshared}}}: {{(doc.IsWorkshared ? {yesText} : {noText})}}"");
+            sb.AppendLine($""- {{{levels}}}: {{new FilteredElementCollector(doc).OfClass(typeof(Level)).GetElementCount()}}"");
+            sb.AppendLine($""- {{{phases}}}: {{doc.Phases.Size}}"");
+            sb.AppendLine($""- {{{totalElements}}}: {{new FilteredElementCollector(doc).WhereElementIsNotElementType().GetElementCount()}}"");
+            if (doc.IsWorkshared)
+            {{
+                var userWorksetCount = new FilteredWorksetCollector(doc)
+                    .OfKind(WorksetKind.UserWorkset)
+                    .ToWorksets()
+                    .Count;
+                sb.AppendLine($""- {{{worksets}}}: {{userWorksetCount}}"");
+            }}
+
+            var activeView = doc.ActiveView;
+            if (activeView != null)
+            {{
+                sb.AppendLine();
+                sb.AppendLine(""["" + {viewHeader} + ""]"");
+                sb.AppendLine($""- {{{viewName}}}: {{activeView.Name}}"");
+                sb.AppendLine($""- {{{viewType}}}: {{activeView.ViewType}}"");
+                sb.AppendLine($""- {{{viewScale}}}: 1:{{activeView.Scale}}"");
+                sb.AppendLine($""- {{{detailLevel}}}: {{activeView.DetailLevel}}"");
+
+                if (activeView.ViewTemplateId != ElementId.InvalidElementId)
+                {{
+                    var template = doc.GetElement(activeView.ViewTemplateId);
+                    if (template != null)
+                        sb.AppendLine($""- {{{viewTemplate}}}: {{template.Name}}"");
+                }}
+
+                try
+                {{
+                    var visibleElementCount = new FilteredElementCollector(doc, activeView.Id)
+                        .WhereElementIsNotElementType()
+                        .GetElementCount();
+                    sb.AppendLine($""- {{{viewElements}}}: {{visibleElementCount}}"");
+                }}
+                catch
+                {{
+                }}
+
+                try
+                {{
+                    var visibleCats = doc.Settings.Categories
+                        .Cast<Category>()
+                        .Where(cat => cat != null && cat.get_Visible(activeView))
+                        .Select(cat => cat.Name)
+                        .Where(name => !string.IsNullOrWhiteSpace(name))
+                        .Take(20)
+                        .ToList();
+
+                    sb.AppendLine($""- {{{visibleCategories}}}: {{(visibleCats.Count > 0 ? string.Join("", "", visibleCats) : {noneText})}}"");
+                }}
+                catch
+                {{
+                }}
+            }}
+
+            sb.AppendLine();
+            sb.AppendLine(""["" + {selectionHeader} + ""]"");
+            var selectedIds = uidoc.Selection.GetElementIds();
+            sb.AppendLine($""- {{{selectedCount}}}: {{selectedIds.Count}}"");
+            if (selectedIds.Count > 0)
+            {{
+                var selectedCats = selectedIds
+                    .Select(id => doc.GetElement(id))
+                    .Where(elem => elem != null && elem.Category != null)
+                    .GroupBy(elem => elem.Category.Name)
+                    .OrderByDescending(group => group.Count())
+                    .Take(10)
+                    .Select(group => $""{{group.Key}} ({{group.Count()}})"")
+                    .ToList();
+
+                sb.AppendLine($""- {{{selectedCategories}}}: {{(selectedCats.Count > 0 ? string.Join("", "", selectedCats) : {noneText})}}"");
+            }}
+
+            return sb.ToString().Trim();
+        }}
+    }}
+}}";
+        }
+
+        private string BuildTaskExecutionPrompt(TaskState task)
+        {
+            string executionLog = BuildExecutionLogContext();
+            string commentLangRule = AppLanguage.IsEnglish
+                ? "\n- Write all C# code comments and user-visible string literals in English."
+                : "\n- ?? ??? ????? ???? ???? ?? ???? ?????.";
+
+            return $@"Implement the following Revit task.
+
+Task title:
+{task.Title}
+
+Task summary:
+{task.Summary}
+
+Task kind:
+{task.Kind}
+
+Required behavior:
+{string.Join(Environment.NewLine, (task.Steps ?? new List<string>()).Select((step, index) => $"{index + 1}. {step}"))}
+
+User-provided details:
+{string.Join(Environment.NewLine, (task.CollectedInputs ?? new List<string>()).Select(input => $"- {input}"))}
+
+Recent execution history (use this to avoid repeating the same errors):
+{executionLog}
+
+Constraints:
+- Respect the current Revit version and available API surface.
+- Do not guess requirements beyond the task summary.
+- Prefer safe, minimal changes.
+- If a previous execution failed, analyze the error and generate code that avoids the same failure.
+- Return ONLY a ```csharp``` block containing statements for the body of Execute(UIApplication uiApp, Bibim.Core.BibimExecutionContext ctx).
+- Use ctx.Log(""message"") to record intermediate progress (e.g. element counts, decisions, skipped items). These appear in the Bibim panel after execution.
+- Do NOT include using directives, namespace, class, method signature, markdown outside the code block, or explanation text.{commentLangRule}";
+        }
+
+        private ApiInspectionReport InspectGeneratedCode(string sourceCode, ExecutionResult dryRunResult = null)
+        {
+            var validationConfig = ConfigService.GetRagConfig();
+            bool validationEnabled = validationConfig?.ValidationGateEnabled ?? true;
+            bool verifyStageEnabled = validationConfig?.VerifyStageEnabled ?? false;
+
+            var inspector = new ApiInspectorService(
+                validationEnabled || verifyStageEnabled ? _analyzerService : null,
+                ConfigService.GetEffectiveRevitVersion());
+            return inspector.Inspect(sourceCode, dryRunResult);
+        }
+
+        private TaskReviewSummary BuildTaskReviewSummary(ApiInspectionReport report, ExecutionResult dryRunResult = null)
+        {
+            return new TaskReviewSummary
+            {
+                SafeCount = report?.SafeCount ?? 0,
+                VersionSpecificCount = report?.VersionSpecificCount ?? 0,
+                DeprecatedCount = report?.DeprecatedCount ?? 0,
+                AffectedElementCount = dryRunResult?.AffectedElementCount ?? report?.DryRunSummary?.AffectedElementCount ?? 0,
+                PreviewSuccess = dryRunResult?.Success ?? report?.DryRunSummary?.Success ?? false,
+                PreviewError = dryRunResult?.ErrorMessage ?? report?.DryRunSummary?.ErrorMessage,
+                ExecutionSummary = dryRunResult?.Output,
+                AnalyzerDiagnostics = report?.AnalyzerDiagnostics?.Select(d => new TaskDiagnosticSummary
+                {
+                    Id = d.Id,
+                    Message = d.Message,
+                    Severity = d.Severity.ToString().ToLowerInvariant(),
+                    Line = d.Line
+                }).ToList() ?? new List<TaskDiagnosticSummary>()
+            };
+        }
+
+        private async Task<ExecutionResult> ExecuteCompiledCodeAsync(bool isDryRun)
+        {
+            return await ExecuteCompilationAsync(
+                _lastCodeGenResult?.CompilationResult,
+                isDryRun,
+                GetActiveTask());
+        }
+
+        private async Task<ExecutionResult> ExecuteCompilationAsync(
+            CompilationResult compilationResult,
+            bool isDryRun,
+            TaskState task = null)
+        {
+            if (compilationResult?.Assembly == null)
+                throw new InvalidOperationException("No compiled assembly is available.");
+
+            var request = new ExecutionRequest
+            {
+                CompiledAssembly = compilationResult.Assembly,
+                EntryTypeName = "BibimGenerated.Program",
+                EntryMethodName = "Execute",
+                IsDryRun = isDryRun,
+                ExpectedDocumentTitle = task?.TargetDocumentTitle,
+                ExpectedDocumentPath = task?.TargetDocumentPath,
+                Callback = new TaskCompletionSource<ExecutionResult>(
+                    TaskCreationOptions.RunContinuationsAsynchronously)
+            };
+
+            BibimApp.ExecutionHandler.Enqueue(request);
+            BibimApp.ExecutionEvent.Raise();
+            return await request.Callback.Task;
+        }
+
+        private async Task RunBuiltInCurrentContextSummaryTaskAsync(TaskState task)
+        {
+            _bridge.PostMessage("progress", new[] {
+                new { label = UiText("Analyzing the current model and view...", "?? ??? ?? ???? ?..."), status = "active" }
+            });
+
+            try
+            {
+                var compiler = GetCompiler();
+                string code = BuildCurrentContextSummaryCode();
+                var compileResult = compiler.Compile(code);
+
+                if (!compileResult.Success)
+                {
+                    task.Stage = TaskStages.Review;
+                    task.ResultSummary = $"Built-in analysis failed: {compileResult.ErrorSummary}";
+                    task.GeneratedCode = code;
+                    UpsertTask(task, autoOpen: true);
+                    PostStreamingEndMessage(task.ResultSummary, "error");
+                    return;
+                }
+
+                task.GeneratedCode = code;
+                var execResult = await ExecuteCompilationAsync(compileResult, isDryRun: true, task);
+                BindTaskToExecutedDocument(task, execResult);
+                task.Review = new TaskReviewSummary
+                {
+                    AffectedElementCount = 0,
+                    PreviewSuccess = execResult.Success,
+                    PreviewError = execResult.Success ? null : execResult.ErrorMessage,
+                    ExecutionSummary = execResult.Output
+                };
+                task.ExecutionSuccess = execResult.Success;
+                task.Stage = execResult.Success ? TaskStages.Completed : TaskStages.Review;
+                task.ResultSummary = execResult.Success
+                    ? execResult.Output
+                    : $"Execution failed: {execResult.ErrorMessage}";
+                UpsertTask(task, autoOpen: true);
+
+                SendAssistantMessage(task.ResultSummary, "text", messageType: execResult.Success ? "normal" : "error");
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError("BuiltInReadTask", ex);
+                task.Stage = TaskStages.Review;
+                task.ResultSummary = $"Built-in analysis failed: {ex.Message}";
+                UpsertTask(task, autoOpen: true);
+                SendAssistantMessage(task.ResultSummary, "text", messageType: "error");
+            }
+            finally
+            {
+                _bridge.PostMessage("progress", new object[0]);
+            }
+        }
+
+        // Registers an async bridge handler with standard Task.Run + try/catch boilerplate.
+        // swallowCancellation: if true, OperationCanceledException is logged at Info level (not Error).
+        private void RegisterAsyncHandler(string type,
+            Func<Newtonsoft.Json.Linq.JObject, Task> handler,
+            bool swallowCancellation = false)
+        {
+            _bridge.On(type, (payloadJson) =>
+            {
+                Task.Run(async () =>
+                {
+                    try
+                    {
+                        var payload = Newtonsoft.Json.Linq.JObject.Parse(payloadJson ?? "{}");
+                        await handler(payload);
+                    }
+                    catch (OperationCanceledException) when (swallowCancellation)
+                    {
+                        Logger.Log("BridgeHandler", $"{type} cancelled");
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.LogError($"BridgeHandler.{type}", ex);
+                    }
+                });
+            });
+        }
+
+        // Registers a synchronous bridge handler with standard try/catch boilerplate.
+        private void RegisterSyncHandler(string type,
+            Action<Newtonsoft.Json.Linq.JObject> handler)
+        {
+            _bridge.On(type, (payloadJson) =>
+            {
+                try
+                {
+                    var payload = Newtonsoft.Json.Linq.JObject.Parse(payloadJson ?? "{}");
+                    handler(payload);
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogError($"BridgeHandler.{type}", ex);
+                }
+            });
+        }
+
+        private void RegisterBridgeHandlers()
+        {
+            _bridge.On("user_message", (payloadJson) =>
+            {
+                Task.Run(async () =>
+                {
+                    try
+                    {
+                        Logger.Log("BridgeHandler", $"user_message processing: {payloadJson}");
+
+                        var payload = Newtonsoft.Json.Linq.JObject.Parse(payloadJson);
+                        string userText = payload["text"]?.ToString() ?? "";
+
+                        if (string.IsNullOrWhiteSpace(userText))
+                        {
+                            PostStreamingEndMessage(
+                                UiText("Empty message.", "? ??????."));
+                            return;
+                        }
+
+                        // Pre-flight credential check. Local provider uses LocalServerUrl
+                        // as the gate (API key is optional — Ollama / LM Studio default
+                        // is unauthenticated). All other providers require an API key.
+                        var preCheckCreds = ConfigService.GetActiveCredentials();
+                        bool credsMissing;
+                        string credsMissingMessage;
+                        if (preCheckCreds.Provider == "local")
+                        {
+                            credsMissing = string.IsNullOrWhiteSpace(
+                                ConfigService.GetRagConfig()?.LocalServerUrl);
+                            credsMissingMessage = UiText(
+                                "Local LLM server URL is not configured. Open **Settings** (gear icon) and enter your server URL under Local LLM.",
+                                "Local LLM ?? URL? ???? ?? ????. **??** (???? ???) ? Local LLM ???? ?? URL? ??? ???.");
+                        }
+                        else
+                        {
+                            credsMissing = string.IsNullOrEmpty(preCheckCreds.ApiKey);
+                            credsMissingMessage = UiText(
+                                "API key is not configured for the selected model. Please go to **Settings** (gear icon) and enter the matching API key.",
+                                "??? ??? API ?? ???? ?? ????. **??** (???? ???)?? ?? ?? ??? ???.");
+                        }
+                        if (credsMissing)
+                        {
+                            PostStreamingEndMessage(credsMissingMessage);
+                            return;
+                        }
+
+                        await ChatWithLlmServiceAsync(userText);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        Logger.Log("BridgeHandler", "Streaming cancelled by user");
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.LogError("BridgeHandler.user_message", ex);
+                        try
+                        {
+                            _bridge.PostMessage("streaming_end", new
+                            {
+                                text = $"Error: {ex.GetType().Name}: {ex.Message}",
+                                type = "error",
+                                inputTokens = 0,
+                                outputTokens = 0,
+                                elapsedMs = 0
+                            });
+                        }
+                        catch (Exception postEx)
+                        {
+                            Logger.LogError("BridgeHandler.PostError", postEx);
+                        }
+                    }
+                });
+            });
+
+            _bridge.On("cancel", (_) =>
+            {
+                _streamingCts?.Cancel();
+                Logger.Log("BridgeHandler", "Cancel requested");
+            });
+
+            // --- spec_action: confirm / revise / reject spec ---
+            RegisterAsyncHandler("spec_action", async payload =>
+            {
+                string action = payload["action"]?.ToString() ?? "";
+                string feedback = payload["feedback"]?.ToString() ?? "";
+                Logger.Log("BridgeHandler", $"spec_action: {action}");
+
+                if (action == "confirm")
+                {
+                    _bridge.PostMessage("system_message",
+                        UiText("Spec confirmed. Generating code...", "??? ???????. ??? ?????..."));
+                    await GenerateCodeFromSpecAsync();
+                }
+                else if (action == "revise")
+                {
+                    string revisePrompt = string.IsNullOrEmpty(feedback)
+                        ? "Please revise the spec."
+                        : $"Please revise the spec based on this feedback: {feedback}";
+                    await ChatWithLlmServiceAsync(revisePrompt);
+                }
+                else if (action == "reject")
+                {
+                    _bridge.PostMessage("system_message",
+                        UiText("Spec rejected.", "??? ???????."));
+                }
+            });
+
+            // --- question_answers: structured Q&A from Question Card UI ---
+            RegisterAsyncHandler("question_answers", payload =>
+            {
+                var answers = payload["answers"] as Newtonsoft.Json.Linq.JArray;
+                Logger.Log("BridgeHandler", $"question_answers: {answers?.Count ?? 0} answers");
+
+                var task = GetActiveTask();
+                if (task == null || answers == null) return Task.CompletedTask;
+
+                foreach (var answerObj in answers)
+                {
+                    string qId = answerObj["id"]?.ToString();
+                    string answer = answerObj["answer"]?.ToString();
+                    bool skipped = answerObj["skipped"]?.ToObject<bool>() ?? false;
+                    var question = task.Questions?.FirstOrDefault(q => q.Id == qId);
+                    if (question != null) { question.Answer = answer; question.Skipped = skipped; }
+                }
+
+                var qaSummary = new System.Text.StringBuilder();
+                foreach (var q in task.Questions ?? new List<QuestionItem>())
+                {
+                    string answerText = q.Skipped
+                        ? UiText("(skipped)", "(???)")
+                        : (q.Answer ?? UiText("(no answer)", "(?? ??)"));
+                    qaSummary.AppendLine($"Q: {q.Text}");
+                    qaSummary.AppendLine($"A: {answerText}");
+                }
+
+                string qaText = qaSummary.ToString().Trim();
+                AppendTaskUserInput(task, qaText);
+
+                bool allSkipped = task.Questions != null
+                    && task.Questions.Count > 0
+                    && task.Questions.All(q => q.Skipped);
+                if (allSkipped)
+                {
+                    _bridge.PostMessage("system_message",
+                        UiText(
+                            "All questions were skipped. Bibim will proceed with default assumptions, but the result may not match your intent.",
+                            "?? ??? ???????. Bibim? ????? ?????, ??? ??? ?? ? ????."));
+                }
+
+                lock (_chatHistoryLock) _chatHistory.Add(new ChatMessage { Text = qaText, IsUser = true });
+                _sessionManager?.AddMessage(_activeSessionId, "user", "text", qaText);
+
+                task.Questions = new List<QuestionItem>();
+                task.Stage = TaskStages.Review;
+                UpsertTask(task, autoOpen: true);
+                SendSessionList();
+
+                _bridge.PostMessage("streaming_end", new
+                {
+                    text = qaText,
+                    type = "normal",
+                    isUser = true,
+                    inputTokens = 0,
+                    outputTokens = 0,
+                    elapsedMs = 0
+                });
+
+                return Task.CompletedTask;
+            });
+
+            RegisterAsyncHandler("task_action", async payload =>
+            {
+                string action = payload["action"]?.ToString() ?? "";
+                Logger.Log("BridgeHandler", $"task_action: {action}");
+
+                var task = GetActiveTask();
+                if (task == null) return;
+
+                if (action == "confirm")
+                {
+
+                    ApplyParameterCreationGuard(task);
+
+                    if (task.Questions != null && task.Questions.Count > 0)
+                    {
+                        task.Stage = TaskStages.NeedsDetails;
+                        UpsertTask(task, autoOpen: true);
+                        string questionText = BuildTaskQuestionsMessage(task);
+                        _bridge.PostMessage("system_message",
+                            UiText("I still need a few details before I can continue this task.",
+                                "? ??? ????? ?? ? ?? ??? ? ?????."));
+                        SendAssistantMessage(questionText, "question", messageType: "question");
+                        return;
+                    }
+
+                    task.Stage = TaskStages.Working;
+                    UpsertTask(task, autoOpen: true);
+                    if (IsBuiltInCurrentContextSummaryTaskV2(task))
+                    {
+                        ApplyCurrentContextSummaryDefaults(task);
+                        _bridge.PostMessage("system_message",
+                            UiText("Task confirmed. Analyzing the current model and view...",
+                                "??? ??????. ?? ??? ?? ?????..."));
+                        await RunBuiltInCurrentContextSummaryTaskAsync(task);
+                    }
+                    else
+                    {
+                        _bridge.PostMessage("system_message",
+                            UiText("Task confirmed. Generating code and running a preview...",
+                                "??? ??????. ??? ???? ?? ?????..."));
+                        await GenerateCodeFromTaskAsync(task, runAfterGeneration: true);
+                    }
+                }
+                else if (action == "cancel")
+                {
+                    task.Stage = TaskStages.Cancelled;
+                    task.ResultSummary = UiText("Task cancelled.", "??? ???????.");
+                    UpsertTask(task, autoOpen: false);
+                    _sessionContext.ActiveTaskId = null;
+                    SaveSessionContext();
+                    SendTaskState();
+                    SendTaskList();
+                }
+            });
+
+            // --- execute: dryrun / commit ---
+            RegisterAsyncHandler("execute", async payload =>
+            {
+                string mode = payload["mode"]?.ToString() ?? "dryrun";
+                bool isDryRun = mode == "dryrun";
+                Logger.Log("BridgeHandler", $"execute: mode={mode}");
+
+
+                if (_lastCodeGenResult?.CompilationResult?.Assembly == null)
+                {
+                    _bridge.PostMessage("system_message",
+                        UiText("No compiled code available. Generate code first.", "??? ??? ??? ????. ?? ??? ?????."));
+                    return;
+                }
+
+                _bridge.PostMessage("progress", new[] {
+                    new { label = isDryRun
+                        ? UiText("Running preview...", "????? ???? ?...")
+                        : UiText("Applying changes...", "?? ?? ?? ?..."), status = "active" }
+                });
+
+                var execResult = await ExecuteCompiledCodeAsync(isDryRun);
+                var task = GetActiveTask();
+                BindTaskToExecutedDocument(task, execResult);
+
+                if (_sessionContext != null)
+                {
+                    _sessionContext.RecordExecution(new ExecutionLogEntry
+                    {
+                        TaskId = task?.TaskId,
+                        TaskTitle = task?.Title,
+                        Success = execResult.Success,
+                        Output = execResult.Success ? execResult.Output : null,
+                        ErrorMessage = execResult.ErrorMessage,
+                        IsDryRun = isDryRun
+                    });
+                    SaveSessionContext();
+                }
+
+                var report = !string.IsNullOrWhiteSpace(_lastCodeGenResult.GeneratedCode)
+                    ? InspectGeneratedCode(_lastCodeGenResult.GeneratedCode, execResult)
+                    : null;
+
+                if (task != null && isDryRun)
+                {
+                    task.Stage = TaskStages.PreviewReady;
+                    task.Review = BuildTaskReviewSummary(report, execResult);
+                    task.ResultSummary = execResult.Success
+                        ? UiText("Preview completed. Review the result before applying changes.",
+                            "?? ??? ???????. ??? ??? ? ?? ?????.")
+                        : UiText("Preview failed. Review the result and adjust the task.",
+                            "?? ??? ??????. ??? ???? ??? ?????.");
+                    UpsertTask(task, autoOpen: true);
+                }
+                else if (task != null && !isDryRun)
+                {
+                    task.ExecutionSuccess = execResult.Success;
+                    task.Stage = execResult.Success ? TaskStages.Completed : TaskStages.PreviewReady;
+                    task.WasApplied = execResult.Success;
+                    task.ResultSummary = execResult.Success
+                        ? execResult.Output
+                        : $"Execution failed: {execResult.ErrorMessage}";
+                    task.Review = BuildTaskReviewSummary(report, execResult);
+                    UpsertTask(task, autoOpen: !execResult.Success);
+                }
+
+                if (!isDryRun || !execResult.Success)
+                {
+                    var action = (!isDryRun && execResult.Success)
+                        ? TrackAppliedAction(task)
+                        : null;
+
+                    // Append ctx.Log() entries to output when present
+                    string baseOutput = execResult.Success
+                        ? execResult.Output
+                        : $"Execution failed: {execResult.ErrorMessage}";
+                    string messageText = baseOutput;
+                    if (execResult.HasExecutionLogs)
+                    {
+                        string logBlock = string.Join("\n", execResult.ExecutionLogs.Select(l => $"• {l}"));
+                        messageText = $"{baseOutput}\n\n[Log]\n{logBlock}";
+                    }
+
+                    PostStreamingEndMessage(
+                        messageText,
+                        execResult.Success ? "normal" : "error",
+                        inputTokens: 0, outputTokens: 0, elapsedMs: 0,
+                        actionId: action?.ActionId,
+                        taskId: action?.TaskId,
+                        canUndo: action?.CanUndo ?? false,
+                        feedbackEnabled: false,
+                        feedbackState: action?.FeedbackState);
+
+                    if (action != null)
+                        _bridge.PostMessage("feedback_request", new { actionId = action.ActionId, taskId = action.TaskId });
+
+                    // If Revit warnings fired during commit, prompt user to re-generate
+                    if (!isDryRun && execResult.Success && execResult.HasRevitWarnings)
+                    {
+                        string warningList = string.Join("\n", execResult.RevitWarnings.Select(w => $"- {w}"));
+                        string warningPrompt = AppLanguage.IsEnglish
+                            ? $"Execution succeeded, but the following Revit warnings occurred:\n{warningList}\n\nWould you like to regenerate the code to address these?"
+                            : $"?? ??? ?? ???, ?? Revit ??? ??????:\n{warningList}\n\n? ???? ???? ?? ??????";
+                        _lastRevitWarnings = execResult.RevitWarnings;
+                        _bridge.PostMessage("revit_warning", new
+                        {
+                            message = warningPrompt,
+                            warnings = execResult.RevitWarnings,
+                            taskId = task?.TaskId
+                        });
+                    }
+
+                    _sessionManager?.AddMessage(_activeSessionId, "assistant",
+                        execResult.Success ? "text" : "error", messageText);
+                    SendSessionList();
+                }
+
+                _bridge.PostMessage("progress", new object[0]);
+            });
+
+            // warning_response: user replied to revit_warning prompt (yes / no / add)
+            RegisterAsyncHandler("warning_response", async payload =>
+            {
+                string choice = payload["choice"]?.ToString(); // "yes" | "no" | "add"
+                string extraText = payload["text"]?.ToString() ?? "";
+                string taskId = payload["taskId"]?.ToString();
+
+                if (string.Equals(choice, "no", StringComparison.OrdinalIgnoreCase))
+                    return;
+
+
+                // Retrieve task for context
+                var task = (!string.IsNullOrWhiteSpace(taskId)
+                               ? GetTasks().FirstOrDefault(t => t.TaskId == taskId)
+                               : null)
+                           ?? GetTasks().LastOrDefault();
+                if (task == null)
+                {
+                    _bridge.PostMessage("system_message",
+                        UiText("No active task to regenerate.", "???? ?? ???? ????."));
+                    return;
+                }
+
+                string warningContext = AppLanguage.IsEnglish
+                    ? "The previous code executed but triggered Revit warnings. Please regenerate to address them."
+                    : "?? ?? ?? ? Revit ??? ??????. ?? ????? ??? ?? ??????.";
+                if (_lastRevitWarnings?.Count > 0)
+                    warningContext += "\n\nRevit warnings:\n" + string.Join("\n", _lastRevitWarnings.Select(w => $"- {w}"));
+                if (!string.IsNullOrWhiteSpace(extraText))
+                    warningContext += AppLanguage.IsEnglish
+                        ? $"\n\nAdditional requirement: {extraText}"
+                        : $"\n\n?? ??: {extraText}";
+
+                _bridge.PostMessage("progress", new[]
+                {
+                    new { label = UiText("Regenerating code...", "?? ??? ?..."), status = "active" }
+                });
+
+                await GenerateCodeFromTaskAsync(task, runAfterGeneration: true, additionalContext: warningContext);
+            });
+
+            RegisterAsyncHandler("undo_last_apply", async payload =>
+            {
+                string actionId = payload["actionId"]?.ToString();
+
+                if (_lastAppliedAction == null || !_lastAppliedAction.CanUndo)
+                {
+                    _bridge.PostMessage("system_message",
+                        UiText("There is no recent apply to undo.", "??? ?? ?? ??? ????."));
+                    return;
+                }
+
+
+                if (!string.IsNullOrWhiteSpace(actionId) &&
+                    !string.Equals(actionId, _lastAppliedAction.ActionId, StringComparison.Ordinal))
+                {
+                    _bridge.PostMessage("system_message",
+                        UiText("Only the latest applied change can be undone.",
+                            "?? ??? ?? ??? ??? ??? ? ????."));
+                    return;
+                }
+
+                _bridge.PostMessage("progress", new[] {
+                    new { label = UiText("Reverting the last applied change...", "??? ?? ??? ???? ?..."), status = "active" }
+                });
+
+                long undoDocumentSequence = DocumentChangeTracker.GetCurrentSequence(
+                    _lastAppliedAction.TargetDocumentTitle,
+                    _lastAppliedAction.TargetDocumentPath);
+                if (undoDocumentSequence > _lastAppliedAction.DocumentChangeSequence)
+                {
+                    _lastAppliedAction.CanUndo = false;
+                    SendMessageActionState(_lastAppliedAction);
+                    _lastAppliedAction = null;
+                    _bridge.PostMessage("system_message",
+                        UiText(
+                            "Undo is no longer available because the document changed after apply.",
+                            "?? ?? ??? ???? ????? ? ?? ??? ? ????."));
+                    _bridge.PostMessage("progress", new object[0]);
+                    return;
+                }
+
+                var action = _lastAppliedAction;
+                var undoResult = await UndoLastApplyAsync(action);
+                if (!undoResult.Success)
+                {
+                    PostStreamingEndMessage($"{UiText("Undo failed", "???? ??")}: {undoResult.ErrorMessage}", "error");
+                    _bridge.PostMessage("progress", new object[0]);
+                    return;
+                }
+
+                action.CanUndo = false;
+                SendMessageActionState(action);
+                _lastAppliedAction = null;
+
+                var task = FindTask(action.TaskId);
+                if (task != null)
+                {
+                    task.Stage = TaskStages.PreviewReady;
+                    task.WasApplied = false;
+                    task.ResultSummary = UiText(
+                        "The last applied change was reverted. Review the result and apply again if needed.",
+                        "??? ?? ?? ??? ??????. ???? ??? ?? ??? ? ??????.");
+                    UpsertTask(task, autoOpen: true);
+                }
+
+                string undoMsg = UiText("The last applied change was reverted.", "??? ?? ?? ??? ??????.");
+                PostStreamingEndMessage(undoMsg, "system");
+                _sessionManager?.AddMessage(_activeSessionId, "assistant", "system", undoMsg);
+                SendSessionList();
+                _bridge.PostMessage("progress", new object[0]);
+            });
+
+            RegisterAsyncHandler("task_feedback", payload =>
+            {
+                string actionId = payload["actionId"]?.ToString() ?? "";
+                string vote = payload["vote"]?.ToString() ?? "";
+                string taskId = payload["taskId"]?.ToString() ?? "";
+
+                if (string.IsNullOrWhiteSpace(actionId) ||
+                    (vote != "up" && vote != "down") ||
+                    !_messageActions.TryGetValue(actionId, out var action)) return Task.CompletedTask;
+
+                action.FeedbackState = vote;
+
+                if (vote == "up")
+                {
+                    _bridge.PostMessage("feedback_update", new { actionId, step = "up_confirmed" });
+                }
+                else
+                {
+                    if (!string.IsNullOrEmpty(action.LibrarySnippetId))
+                        _codeLibrary?.Delete(action.LibrarySnippetId);
+                    _bridge.PostMessage("feedback_update", new { actionId, step = "down_detail" });
+                }
+                return Task.CompletedTask;
+            });
+
+            RegisterAsyncHandler("task_feedback_detail", payload =>
+            {
+                string actionId = payload["actionId"]?.ToString() ?? "";
+                string taskId = payload["taskId"]?.ToString() ?? "";
+                string detail = payload["detail"]?.ToString() ?? "";
+
+                if (string.IsNullOrWhiteSpace(actionId) || string.IsNullOrWhiteSpace(detail)) return Task.CompletedTask;
+                _bridge.PostMessage("feedback_update", new { actionId, step = "regen_offer", detail });
+                return Task.CompletedTask;
+            });
+
+            RegisterAsyncHandler("regenerate_with_feedback", async payload =>
+            {
+                string actionId = payload["actionId"]?.ToString() ?? "";
+                string taskId = payload["taskId"]?.ToString() ?? "";
+                string detail = payload["detail"]?.ToString() ?? "";
+
+
+                string resolvedTaskId = taskId;
+                if (string.IsNullOrWhiteSpace(resolvedTaskId) &&
+                    _messageActions.TryGetValue(actionId, out var fbAction))
+                    resolvedTaskId = fbAction.TaskId;
+
+                var task = FindTask(resolvedTaskId);
+                if (task == null)
+                {
+                    _bridge.PostMessage("system_message",
+                        UiText("Task not found. Please start a new session.", "??? ?? ? ????. ? ??? ??? ???."));
+                    return;
+                }
+
+                string feedbackNote = UiText(
+                    $"[User feedback on previous execution: {detail}]\nPlease regenerate addressing this feedback.",
+                    $"[?? ??? ?? ???: {detail}]\n???? ???? ???? ???.");
+                task.SourceUserMessage = string.IsNullOrEmpty(task.SourceUserMessage)
+                    ? feedbackNote
+                    : $"{task.SourceUserMessage}\n\n{feedbackNote}";
+
+                task.Stage = TaskStages.Working;
+                UpsertTask(task, autoOpen: true);
+
+                _bridge.PostMessage("system_message",
+                    UiText("Regenerating with your feedback...", "???? ???? ?? ?????..."));
+                await GenerateCodeFromTaskAsync(task, runAfterGeneration: true);
+            });
+
+            // --- load_session: restore a previous session ---
+            RegisterSyncHandler("load_session", payload =>
+            {
+                string sessionId = payload["sessionId"]?.ToString() ?? "";
+                Logger.Log("BridgeHandler", $"load_session: {sessionId}");
+
+                if (_sessionManager == null || string.IsNullOrEmpty(sessionId))
+                {
+                    _bridge.PostMessage("system_message", UiText("Session not found.", "??? ?? ? ????."));
+                    return;
+                }
+
+                var session = _sessionManager.LoadSession(sessionId);
+                if (session == null)
+                {
+                    _bridge.PostMessage("system_message", UiText("Session not found.", "??? ?? ? ????."));
+                    return;
+                }
+
+                _activeSessionId = sessionId;
+                lock (_chatHistoryLock) _chatHistory.Clear();
+                _lastCodeGenResult = null;
+                _sessionContext = null;
+                ResetMessageActions();
+
+                TokenTracker.ResetSession();
+                SendActiveSession();
+                EnsureActiveSession(false);
+
+                foreach (var msg in session.Messages)
+                {
+                    lock (_chatHistoryLock) _chatHistory.Add(new ChatMessage { Text = msg.Content, IsUser = msg.Role == "user" });
+
+                    if (msg.Role != "user")
+                        TokenTracker.RestoreSessionUsage(msg.InputTokens, msg.OutputTokens, incrementCallCount: true);
+
+                    if (!string.IsNullOrWhiteSpace(msg.CSharpCode))
+                        RestoreLastCodeGenerationResult(msg.Content, msg.CSharpCode, msg.InputTokens, msg.OutputTokens);
+
+                    string msgType;
+                    switch ((msg.ContentType ?? "").ToLowerInvariant())
+                    {
+                        case "code": case "question": case "system": case "error":
+                            msgType = msg.ContentType.ToLowerInvariant(); break;
+                        default:
+                            msgType = !string.IsNullOrWhiteSpace(msg.CSharpCode) ? "code" : "normal"; break;
+                    }
+
+                    _bridge.PostMessage("streaming_end", new
+                    {
+                        text = msg.Content,
+                        type = msgType,
+                        isUser = msg.Role == "user",
+                        csharpCode = msg.CSharpCode,
+                        inputTokens = msg.InputTokens,
+                        outputTokens = msg.OutputTokens,
+                        elapsedMs = 0,
+                        createdAt = msg.CreatedAt != default ? msg.CreatedAt.ToString("o") : null
+                    });
+                }
+
+                var restoredTask = GetActiveTask();
+                if (_lastCodeGenResult == null && !string.IsNullOrWhiteSpace(restoredTask?.GeneratedCode))
+                    RestoreLastCodeGenerationResult(restoredTask.ResultSummary ?? restoredTask.Title, restoredTask.GeneratedCode, 0, 0);
+
+
+                SendTaskList();
+                SendTaskState();
+                Logger.Log("BridgeHandler", $"Session loaded: {session.Messages.Count} messages");
+            });
+
+            // --- new_session: create a fresh session ---
+            _bridge.On("new_session", (_) =>
+            {
+                try
+                {
+                    Logger.Log("BridgeHandler", "new_session");
+                    lock (_chatHistoryLock) _chatHistory.Clear();
+                    _lastCodeGenResult = null;
+                    _sessionContext = null;
+                    ResetMessageActions();
+                    TokenTracker.ResetSession();
+
+                    if (_sessionManager != null)
+                    {
+                        var session = _sessionManager.CreateSession();
+                        _activeSessionId = session.SessionId;
+        
+                        SendActiveSession();
+                        EnsureActiveSession(false);
+                    }
+
+                    SendSessionList();
+    
+                    SendTaskList();
+                    SendTaskState();
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogError("BridgeHandler.new_session", ex);
+                }
+            });
+
+            // --- delete_session: remove a session from local storage ---
+            RegisterSyncHandler("delete_session", payload =>
+            {
+                string sessionId = payload["sessionId"]?.ToString() ?? "";
+                Logger.Log("BridgeHandler", $"delete_session: {sessionId}");
+                if (_sessionManager == null || string.IsNullOrEmpty(sessionId)) return;
+
+                _sessionManager.DeleteSession(sessionId);
+
+                bool wasActive = _activeSessionId == sessionId;
+                if (wasActive)
+                {
+                    _activeSessionId = null;
+                    lock (_chatHistoryLock) _chatHistory.Clear();
+                    _sessionContext = null;
+                    _lastCodeGenResult = null;
+                    TokenTracker.ResetSession();
+                }
+
+                SendSessionList();
+                if (wasActive) { SendTaskList(); SendTaskState(); }
+                _bridge.PostMessage("session_deleted", new { sessionId, wasActive });
+            });
+
+            // --- rename_session: update a session's title ---
+            RegisterSyncHandler("rename_session", payload =>
+            {
+                string sessionId = payload["sessionId"]?.ToString() ?? "";
+                string title = payload["title"]?.ToString() ?? "";
+                Logger.Log("BridgeHandler", $"rename_session: {sessionId} => {title}");
+                if (_sessionManager == null || string.IsNullOrEmpty(sessionId)) return;
+
+                _sessionManager.RenameSession(sessionId, title);
+                SendSessionList();
+                _bridge.PostMessage("session_renamed", new { sessionId, title });
+            });
+
+            RegisterAsyncHandler("rerun_code", async payload =>
+            {
+                string sourceSessionId = payload["sourceSessionId"]?.ToString() ?? "";
+                string sourceTitle = payload["sourceTitle"]?.ToString() ?? "";
+                string code = payload["code"]?.ToString() ?? "";
+
+                if (string.IsNullOrWhiteSpace(code) || _sessionManager == null) return;
+
+                try
+                {
+                    lock (_chatHistoryLock) _chatHistory.Clear();
+                    _lastCodeGenResult = null;
+                    _sessionContext = null;
+                    ResetMessageActions();
+                    TokenTracker.ResetSession();
+
+                    var session = _sessionManager.CreateSession();
+                    string dateStr = DateTime.Now.ToString("MM.dd");
+                    session.ParentSessionId = string.IsNullOrWhiteSpace(sourceSessionId) ? null : sourceSessionId;
+                    session.Title = string.IsNullOrWhiteSpace(sourceTitle)
+                        ? UiText($"Rerun ({dateStr})", $"??? ({dateStr})")
+                        : $"{sourceTitle} - {UiText($"Rerun ({dateStr})", $"??? ({dateStr})")}";
+
+                    _activeSessionId = session.SessionId;
+                    _sessionManager.SaveSession(session);
+    
+                    SendActiveSession();
+                    EnsureActiveSession(false);
+                    SendSessionList();
+    
+
+                    var compiler = GetCompiler();
+                    var compileResult = compiler.Compile(code);
+                    if (!compileResult.Success)
+                    {
+                        Logger.Log("RerunCode", $"Compile failed: {compileResult.ErrorSummary}");
+                        SendAssistantMessage(
+                            UiText("The code failed to compile and could not be loaded. Please try regenerating.",
+                                   "?? ???? ???? ???? ?????. ?? ??? ???."),
+                            "error", csharpCode: code, messageType: "error");
+                        return;
+                    }
+
+                    _lastCodeGenResult = new CodeGenerationResult
+                    {
+                        Success = true, IsCodeResponse = true, GeneratedCode = code,
+                        CompilationResult = compileResult, CompileAttempts = 1
+                    };
+
+                    SendAssistantMessage(
+                        UiText(
+                            $"I loaded code from history.\nSource session: {sourceTitle}\n\nReview the preview before applying changes.",
+                            $"?????? ??? ??????.\n?? ??: {sourceTitle}\n\n????? ??? ? ?????."),
+                        "text", csharpCode: code, messageType: "system");
+
+                    _bridge.PostMessage("progress", new[] {
+                        new { label = UiText("Running preview...", "????? ???? ?..."), status = "active" }
+                    });
+
+                    var execResult = await ExecuteCompiledCodeAsync(isDryRun: true);
+                    var report = InspectGeneratedCode(code, execResult);
+
+                    var task = new TaskState
+                    {
+                        TaskId = Guid.NewGuid().ToString(),
+                        Title = session.Title,
+                        Summary = UiText("Re-run a previously generated C# script from history.",
+                            "?????? ??? C# ????? ?? ?????."),
+                        Stage = execResult.Success ? TaskStages.PreviewReady : TaskStages.Review,
+                        Kind = TaskKinds.Write, RequiresApply = true, GeneratedCode = code,
+                        Review = BuildTaskReviewSummary(report, execResult),
+                        ResultSummary = execResult.Success
+                            ? UiText("Preview completed. Review the result before applying changes.",
+                                "????? ???????. ??? ??? ? ?? ?????.")
+                            : $"Preview failed: {execResult.ErrorMessage}",
+                    };
+                    BindTaskToExecutedDocument(task, execResult);
+                    UpsertTask(task, autoOpen: true);
+                    SendAssistantMessage(task.ResultSummary, "text", csharpCode: code,
+                        messageType: execResult.Success ? "system" : "error");
+                }
+                finally
+                {
+                    _bridge.PostMessage("progress", new object[0]);
+                }
+            });
+
+            RegisterSyncHandler("edit_code", payload =>
+            {
+                string sourceTitle = payload["sourceTitle"]?.ToString() ?? "";
+                string code = payload["code"]?.ToString() ?? "";
+
+                if (string.IsNullOrWhiteSpace(code) || _sessionManager == null) return;
+
+                lock (_chatHistoryLock) _chatHistory.Clear();
+                _lastCodeGenResult = null;
+                _sessionContext = null;
+                ResetMessageActions();
+                TokenTracker.ResetSession();
+
+                var session = _sessionManager.CreateSession();
+                string dateStr = DateTime.Now.ToString("MM.dd");
+                session.Title = string.IsNullOrWhiteSpace(sourceTitle)
+                    ? UiText($"Edit ({dateStr})", $"?? ({dateStr})")
+                    : $"{sourceTitle} - {UiText($"Edit ({dateStr})", $"?? ({dateStr})")}";
+
+                _activeSessionId = session.SessionId;
+                _sessionManager.SaveSession(session);
+
+                SendActiveSession();
+                EnsureActiveSession(false);
+                SendSessionList();
+
+
+                SendAssistantMessage(
+                    UiText(
+                        $"I loaded code from the library for editing.\n\n```csharp\n{code}\n```\n\nPlease describe the changes you'd like to make.",
+                        $"?? ????? ??? ??????.\n\n```csharp\n{code}\n```\n\n????? ??????."),
+                    "text", csharpCode: code, messageType: "system");
+            });
+
+            // --- OSS: auth/subscription bridge handlers removed (login, logout, check_auth, get_subscription, get_credits) ---
+            // BYOK: no server-side auth. API key is stored locally in rag_config.json.
+
+            _bridge.On("get_app_info", (_) => SendAppInfo());
+            _bridge.On("get_sessions", (_) => SendSessionList());
+            _bridge.On("get_task_state", (_) => SendTaskState());
+            _bridge.On("get_task_list", (_) => SendTaskList());
+            _bridge.On("get_code_library", (_) => SendCodeLibrary());
+            _bridge.On("get_api_key_status", (_) => SendApiKeyStatus());
+            // Anthropic / Claude — kept the legacy "save_api_key" name for back-compat with the frontend.
+            RegisterSyncHandler("save_api_key", payload =>
+            {
+                string newKey = payload["apiKey"]?.ToString() ?? "";
+                try
+                {
+                    ConfigService.SaveApiKeyForProvider("anthropic", newKey);
+                    _llmService = null;
+                    _plannerLlmService = null;
+                    Logger.Log("BridgeHandler", "Anthropic API key saved");
+                    SendApiKeyStatus();
+                    _bridge.PostMessage("api_key_save_result", new { success = true, provider = "anthropic" });
+                }
+                catch (Exception ex)
+                {
+                    Logger.Log("BridgeHandler", $"save_api_key (anthropic) failed: {ex.Message}");
+                    _bridge.PostMessage("api_key_save_result", new { success = false, provider = "anthropic", error = ex.Message });
+                }
+            });
+            RegisterSyncHandler("save_openai_api_key", payload =>
+            {
+                string newKey = payload["apiKey"]?.ToString() ?? "";
+                try
+                {
+                    ConfigService.SaveApiKeyForProvider("openai", newKey);
+                    _llmService = null;
+                    _plannerLlmService = null;
+                    Logger.Log("BridgeHandler", "OpenAI API key saved");
+                    SendApiKeyStatus();
+                    _bridge.PostMessage("api_key_save_result", new { success = true, provider = "openai" });
+                }
+                catch (Exception ex)
+                {
+                    Logger.Log("BridgeHandler", $"save_openai_api_key failed: {ex.Message}");
+                    _bridge.PostMessage("api_key_save_result", new { success = false, provider = "openai", error = ex.Message });
+                }
+            });
+            RegisterSyncHandler("save_deepseek_api_key", payload =>
+            {
+                string newKey = payload["apiKey"]?.ToString() ?? "";
+                try
+                {
+                    ConfigService.SaveApiKeyForProvider("deepseek", newKey);
+                    _llmService = null;
+                    _plannerLlmService = null;
+                    Logger.Log("BridgeHandler", "DeepSeek API key saved");
+                    SendApiKeyStatus();
+                    _bridge.PostMessage("api_key_save_result", new { success = true, provider = "deepseek" });
+                }
+                catch (Exception ex)
+                {
+                    Logger.Log("BridgeHandler", $"save_deepseek_api_key failed: {ex.Message}");
+                    _bridge.PostMessage("api_key_save_result", new { success = false, provider = "deepseek", error = ex.Message });
+                }
+            });
+            RegisterSyncHandler("save_gemini_api_key", payload =>
+            {
+                string newKey = payload["apiKey"]?.ToString() ?? "";
+                try
+                {
+                    ConfigService.SaveApiKeyForProvider("gemini", newKey);
+                    _llmService = null;
+                    _plannerLlmService = null;
+                    Logger.Log("BridgeHandler", "Gemini API key saved");
+                    SendApiKeyStatus();
+                    _bridge.PostMessage("api_key_save_result", new { success = true, provider = "gemini" });
+                    // Legacy event name retained for older frontend builds.
+                    _bridge.PostMessage("gemini_key_save_result", new { success = true });
+                }
+                catch (Exception ex)
+                {
+                    Logger.Log("BridgeHandler", $"save_gemini_api_key failed: {ex.Message}");
+                    _bridge.PostMessage("api_key_save_result", new { success = false, provider = "gemini", error = ex.Message });
+                    _bridge.PostMessage("gemini_key_save_result", new { success = false, error = ex.Message });
+                }
+            });
+            RegisterSyncHandler("save_model", payload =>
+            {
+                string modelId = payload["modelId"]?.ToString() ?? "";
+                try
+                {
+                    ConfigService.SaveModel(modelId);
+                    // Reset LLM service so it picks up new model
+                    _llmService = null;
+                    _plannerLlmService = null;
+                    Logger.Log("BridgeHandler", $"Model saved: {modelId}");
+                    SendApiKeyStatus();
+                    _bridge.PostMessage("model_save_result", new { success = true });
+                }
+                catch (Exception ex)
+                {
+                    Logger.Log("BridgeHandler", $"save_model failed: {ex.Message}");
+                    _bridge.PostMessage("model_save_result", new { success = false, error = ex.Message });
+                }
+            });
+
+            // Save the self-hosted local LLM server config (URL + model name + optional API key).
+            // Empty serverUrl clears the config. Reset cached LLM service so subsequent calls
+            // pick up the new endpoint immediately.
+            RegisterSyncHandler("save_local_llm_config", payload =>
+            {
+                string serverUrl = payload["serverUrl"]?.ToString() ?? "";
+                string modelName = payload["modelName"]?.ToString() ?? "";
+                string apiKey    = payload["apiKey"]?.ToString() ?? "";
+                try
+                {
+                    ConfigService.SaveLocalServerConfig(serverUrl, modelName, apiKey);
+                    _llmService = null;
+                    _plannerLlmService = null;
+                    Logger.Log("BridgeHandler",
+                        $"Local LLM config saved — url={(string.IsNullOrEmpty(serverUrl) ? "(cleared)" : serverUrl)} model={(string.IsNullOrEmpty(modelName) ? "(none)" : modelName)} keyConfigured={!string.IsNullOrEmpty(apiKey)}");
+                    SendApiKeyStatus();
+                    _bridge.PostMessage("api_key_save_result", new { success = true, provider = "local" });
+                }
+                catch (Exception ex)
+                {
+                    Logger.Log("BridgeHandler", $"save_local_llm_config failed: {ex.Message}");
+                    _bridge.PostMessage("api_key_save_result", new { success = false, provider = "local", error = ex.Message });
+                }
+            });
+
+            // Connection probe for the Local LLM section (red/blue indicator).
+            // Performs a GET /models against the supplied URL with optional bearer auth,
+            // returns parsed model count + sample model id, or the upstream error string.
+            RegisterAsyncHandler("test_local_connection", async payload =>
+            {
+                string serverUrl = payload["serverUrl"]?.ToString() ?? "";
+                string apiKey    = payload["apiKey"]?.ToString() ?? "";
+
+                if (string.IsNullOrWhiteSpace(serverUrl))
+                {
+                    _bridge.PostMessage("local_connection_test_result", new
+                    {
+                        success = false,
+                        error = "Server URL is empty."
+                    });
+                    return;
+                }
+
+                try
+                {
+                    // Construct a throwaway provider just for the /models call.
+                    // modelId is required by the ctor but unused on /models.
+                    var probe = new LocalProvider(
+                        apiKey: apiKey,
+                        modelId: "probe/dummy",
+                        httpClient: _downloadHttpClient,
+                        baseUrl: serverUrl,
+                        serverModelName: null);
+
+                    using (var cts = new CancellationTokenSource(TimeSpan.FromSeconds(8)))
+                    {
+                        var modelsJson = await probe.ListModelsAsync(cts.Token);
+                        var data = modelsJson?["data"] as Newtonsoft.Json.Linq.JArray;
+                        int count = data?.Count ?? 0;
+
+                        // Return the full id list (capped at 50 entries to bound the
+                        // payload — most local servers expose 1-10 models, but some
+                        // proxies in front of model hubs expose hundreds). The frontend
+                        // uses this list to auto-populate the model selector so the
+                        // user doesn't have to know the exact server-side model name.
+                        var modelIds = new List<string>();
+                        if (data != null)
+                        {
+                            foreach (var entry in data)
+                            {
+                                if (modelIds.Count >= 50) break;
+                                string id = entry?["id"]?.ToString();
+                                if (!string.IsNullOrWhiteSpace(id)) modelIds.Add(id);
+                            }
+                        }
+
+                        _bridge.PostMessage("local_connection_test_result", new
+                        {
+                            success = true,
+                            modelCount = count,
+                            firstModel = modelIds.Count > 0 ? modelIds[0] : "",
+                            models = modelIds   // NEW: full list for the auto-populate dropdown
+                        });
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    _bridge.PostMessage("local_connection_test_result", new
+                    {
+                        success = false,
+                        error = "Connection timed out after 8 seconds."
+                    });
+                }
+                catch (Exception ex)
+                {
+                    Logger.Log("BridgeHandler", $"test_local_connection failed: {ex.Message}");
+                    _bridge.PostMessage("local_connection_test_result", new
+                    {
+                        success = false,
+                        error = ex.Message
+                    });
+                }
+            });
+            RegisterSyncHandler("get_code_snippet", payload =>
+            {
+                var snippet = _codeLibrary?.GetById(payload["id"]?.ToString());
+                if (snippet != null)
+                    _bridge.PostMessage("code_snippet", new
+                    {
+                        id = snippet.Id,
+                        title = snippet.Title,
+                        summary = snippet.Summary,
+                        code = snippet.Code,
+                        revitVersion = snippet.RevitVersion,
+                        taskKind = snippet.TaskKind,
+                        sourceSessionId = snippet.SourceSessionId,
+                        createdAt = snippet.CreatedAt.ToString("o")
+                    });
+            });
+
+            RegisterSyncHandler("delete_code_snippet", payload =>
+            {
+                _codeLibrary?.Delete(payload["id"]?.ToString());
+                SendCodeLibrary();
+            });
+
+            RegisterSyncHandler("rename_snippet", payload =>
+            {
+                _codeLibrary?.RenameSnippet(payload["id"]?.ToString(), payload["title"]?.ToString() ?? "");
+                SendCodeLibrary();
+            });
+
+            RegisterSyncHandler("move_snippet", payload =>
+            {
+                var folderToken = payload["folderId"];
+                string folderId = (folderToken == null || folderToken.Type == Newtonsoft.Json.Linq.JTokenType.Null)
+                    ? null : folderToken.ToString();
+                _codeLibrary?.MoveSnippet(payload["snippetId"]?.ToString(), folderId);
+                SendCodeLibrary();
+            });
+
+            RegisterSyncHandler("create_folder", payload =>
+            {
+                _codeLibrary?.CreateFolder(payload["name"]?.ToString() ?? "New Folder", payload["parentId"]?.ToString());
+                SendCodeLibrary();
+            });
+
+            RegisterSyncHandler("rename_folder", payload =>
+            {
+                _codeLibrary?.RenameFolder(payload["id"]?.ToString(), payload["name"]?.ToString() ?? "");
+                SendCodeLibrary();
+            });
+
+            RegisterSyncHandler("delete_folder", payload =>
+            {
+                _codeLibrary?.DeleteFolder(payload["id"]?.ToString());
+                SendCodeLibrary();
+            });
+
+            RegisterAsyncHandler("check_update", async _ =>
+            {
+                var result = await VersionChecker.CheckForUpdatesAsync();
+                BibimApp.LastVersionCheckResult = result.UpdateRequired ? result : null;
+                SendUpdateInfo(result);
+            });
+
+            RegisterAsyncHandler("download_update", async payload =>
+            {
+                string url = payload["url"]?.ToString() ?? "";
+                string version = payload["version"]?.ToString() ?? "";
+                if (string.IsNullOrWhiteSpace(url)) return;
+
+                // Defense-in-depth: even though `url` originates from VersionChecker's
+                // GitHub Releases API call, by the time it reaches this handler it has
+                // round-tripped through the WebView; treat as untrusted. Reject anything
+                // that isn't https on a known release-asset host. Failing closed here
+                // is the safer default — the user can always download manually via
+                // open_url if the URL is legitimate but on a new host.
+                if (!IsTrustedReleaseAssetUrl(url, out string urlRejectReason))
+                {
+                    Logger.Log("BridgeHandler",
+                        $"download_update: rejected URL ({urlRejectReason}): {Truncate(url, 200)}");
+                    _bridge?.PostMessage("download_progress",
+                        new { status = "error", error = "untrusted_url" });
+                    return;
+                }
+
+                string downloadsFolder = System.IO.Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
+                System.IO.Directory.CreateDirectory(downloadsFolder);
+
+                string fileName = string.IsNullOrWhiteSpace(version)
+                    ? "Bibim_AI_Setup.exe"
+                    : $"Bibim_AI_v{version}_Setup.exe";
+                string filePath = System.IO.Path.Combine(downloadsFolder, fileName);
+
+                _bridge?.PostMessage("download_progress", new { status = "downloading" });
+
+                // Hard cap the entire download — body streaming bypasses the
+                // HttpClient.Timeout default (which only covers headers in async paths),
+                // so without a token a stuck connection can keep the UI in "downloading"
+                // forever. 10 min is generous for a ~50MB installer over a slow link.
+                using (var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromMinutes(10)))
+                {
+                    try
+                    {
+                        using (var response = await _downloadHttpClient.GetAsync(
+                                   url,
+                                   System.Net.Http.HttpCompletionOption.ResponseHeadersRead,
+                                   cts.Token))
+                        {
+                            response.EnsureSuccessStatusCode();
+                            using (var stream = await response.Content.ReadAsStreamAsync())
+                            using (var fs = new System.IO.FileStream(filePath, System.IO.FileMode.Create))
+                            {
+                                await stream.CopyToAsync(fs, 81920, cts.Token);
+                            }
+                        }
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        Logger.Log("BridgeHandler", "download_update: timeout (10 min) reached");
+                        _bridge?.PostMessage("download_progress",
+                            new { status = "error", error = "timeout" });
+                        try { if (System.IO.File.Exists(filePath)) System.IO.File.Delete(filePath); } catch { }
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Log("BridgeHandler", $"download_update: {ex.GetType().Name}: {ex.Message}");
+                        _bridge?.PostMessage("download_progress",
+                            new { status = "error", error = "network" });
+                        try { if (System.IO.File.Exists(filePath)) System.IO.File.Delete(filePath); } catch { }
+                        return;
+                    }
+                }
+
+                _bridge?.PostMessage("download_complete", new { folderPath = downloadsFolder, fileName });
+            });
+
+            RegisterSyncHandler("open_folder", payload =>
+            {
+                string path = payload["path"]?.ToString() ?? "";
+                if (!string.IsNullOrWhiteSpace(path) && System.IO.Directory.Exists(path))
+                    System.Diagnostics.Process.Start("explorer.exe", path);
+            });
+
+            RegisterSyncHandler("open_url", payload =>
+            {
+                string url = payload["url"]?.ToString() ?? "";
+                if (!string.IsNullOrWhiteSpace(url)
+                    && (url.StartsWith("https://") || url.StartsWith("http://")))
+                {
+                    System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+                    {
+                        FileName = url,
+                        UseShellExecute = true
+                    });
+                }
+            });
+        }
+
+        private void SendApiKeyStatus()
+        {
+            try
+            {
+                string anthropicMasked = ConfigService.GetMaskedKeyForProvider("anthropic");
+                string openAiMasked    = ConfigService.GetMaskedKeyForProvider("openai");
+                string deepSeekMasked  = ConfigService.GetMaskedKeyForProvider("deepseek");
+                string geminiMasked    = ConfigService.GetMaskedKeyForProvider("gemini");
+                string localMasked     = ConfigService.GetMaskedKeyForProvider("local");
+                string activeModel = ConfigService.GetRagConfig()?.ClaudeModel ?? ConfigService.DefaultModelId;
+                string activeProvider = ConfigService.GetActiveProviderName();
+
+                var cfg = ConfigService.GetRagConfig();
+                string localServerUrl = cfg?.LocalServerUrl ?? "";
+                string localModelName = cfg?.LocalModelName ?? "";
+                // Local "configured" is gated by server URL, NOT key (key is optional).
+                bool localConfigured = !string.IsNullOrWhiteSpace(localServerUrl);
+
+                // Aggregate active state — for local, key absence is allowed when URL is set.
+                bool activeConfigured = activeProvider == "local"
+                    ? localConfigured
+                    : !string.IsNullOrEmpty(ConfigService.GetActiveCredentials().ApiKey);
+
+                _bridge?.PostMessage("api_key_status", new
+                {
+                    configured = activeConfigured,
+                    activeProvider,
+                    activeModel,
+                    // Per-provider status for the UI's gated model selector.
+                    anthropic = new { configured = !string.IsNullOrEmpty(anthropicMasked), maskedKey = anthropicMasked },
+                    openai    = new { configured = !string.IsNullOrEmpty(openAiMasked),    maskedKey = openAiMasked },
+                    deepseek  = new { configured = !string.IsNullOrEmpty(deepSeekMasked),  maskedKey = deepSeekMasked },
+                    gemini    = new { configured = !string.IsNullOrEmpty(geminiMasked),    maskedKey = geminiMasked },
+                    local     = new {
+                        configured = localConfigured,
+                        serverUrl  = localServerUrl,
+                        modelName  = localModelName,
+                        maskedKey  = localMasked
+                    },
+                    // Legacy fields kept so older frontend builds keep rendering.
+                    maskedKey = anthropicMasked,
+                    claudeModel = activeModel,
+                    geminiConfigured = !string.IsNullOrEmpty(geminiMasked),
+                    geminiMaskedKey = geminiMasked,
+                });
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError("SendApiKeyStatus", ex);
+                _bridge?.PostMessage("api_key_status", new
+                {
+                    configured = false,
+                    activeProvider = "anthropic",
+                    activeModel = ConfigService.DefaultModelId,
+                    anthropic = new { configured = false, maskedKey = "" },
+                    openai    = new { configured = false, maskedKey = "" },
+                    deepseek  = new { configured = false, maskedKey = "" },
+                    gemini    = new { configured = false, maskedKey = "" },
+                    maskedKey = "",
+                    claudeModel = ConfigService.DefaultModelId,
+                    geminiConfigured = false,
+                    geminiMaskedKey = "",
+                });
+            }
+        }
+
+        private void SendAppInfo()
+        {
+            try
+            {
+                var update = BibimApp.LastVersionCheckResult;
+                _bridge?.PostMessage("app_info", new
+                {
+                    version = BibimApp.AppVersion,
+                    language = LocalizationService.CurrentLanguage,
+                    revitVersion = ConfigService.GetEffectiveRevitVersion(),
+                    updateAvailable = update?.UpdateRequired == true,
+                    updateMandatory = update?.IsMandatory == true,
+                    latestVersion = update?.LatestVersion,
+                    downloadUrl = update?.DownloadUrl,
+                    releaseNotes = update?.ReleaseNotes
+                });
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError("SendAppInfo", ex);
+            }
+        }
+
+        private void OnVersionCheckCompleted(VersionCheckResult result)
+        {
+            SendUpdateInfo(result);
+        }
+
+        private void SendUpdateInfo(VersionCheckResult result)
+        {
+            try
+            {
+                _bridge?.PostMessage("update_info", new
+                {
+                    updateAvailable = result?.UpdateRequired == true,
+                    isMandatory = result?.IsMandatory == true,
+                    currentVersion = result?.CurrentVersion ?? BibimApp.AppVersion,
+                    latestVersion = result?.LatestVersion,
+                    downloadUrl = result?.DownloadUrl,
+                    releaseNotes = result?.ReleaseNotes
+                });
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError("SendUpdateInfo", ex);
+            }
+        }
+
+        private void SendActiveSession()
+        {
+            try
+            {
+                _bridge?.PostMessage("active_session", new { sessionId = _activeSessionId });
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError("SendActiveSession", ex);
+            }
+        }
+
+        /// <summary>
+        /// Send the session list to the frontend for the history panel.
+        /// </summary>
+        private void SendSessionList()
+        {
+            try
+            {
+                if (_sessionManager == null || _bridge == null) return;
+
+                var sessions = _sessionManager.GetAllSessions();
+                var sessionInfos = sessions.Select(s => new
+                {
+                    id = s.SessionId,
+                    title = s.Title ?? "",
+                    createdAt = s.CreatedAt.ToString("o"),
+                    messageCount = s.Messages?.Count ?? 0,
+                    parentSessionId = s.ParentSessionId
+                }).ToArray();
+
+                _bridge.PostMessage("sessions", sessionInfos);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError("SendSessionList", ex);
+            }
+        }
+
+        private void SendCodeLibrary()
+        {
+            try
+            {
+                if (_codeLibrary == null || _bridge == null) return;
+                var snippets = _codeLibrary.GetAll();
+                var folders = _codeLibrary.GetFolders();
+                var snippetItems = snippets.Select(s => new
+                {
+                    id = s.Id,
+                    title = s.Title ?? "",
+                    summary = s.Summary ?? "",
+                    revitVersion = s.RevitVersion ?? "",
+                    taskKind = s.TaskKind ?? "write",
+                    createdAt = s.CreatedAt.ToString("o"),
+                    folderId = s.FolderId  // null = uncategorized
+                }).ToArray();
+                var folderItems = folders.Select(f => new
+                {
+                    id = f.Id,
+                    name = f.Name ?? "",
+                    parentId = f.ParentId
+                }).ToArray();
+                _bridge.PostMessage("code_library", new { folders = folderItems, snippets = snippetItems });
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError("SendCodeLibrary", ex);
+            }
+        }
+
+        private void RestoreLastCodeGenerationResult(string responseText, string code,
+            int inputTokens, int outputTokens)
+        {
+            if (string.IsNullOrWhiteSpace(code))
+                return;
+
+            try
+            {
+                var compiler = GetCompiler();
+                var compileResult = compiler.Compile(code);
+                _lastCodeGenResult = new CodeGenerationResult
+                {
+                    Success = compileResult.Success,
+                    IsCodeResponse = true,
+                    GeneratedCode = code,
+                    RawResponse = responseText,
+                    CompilationResult = compileResult,
+                    CompileAttempts = compileResult.Success ? 1 : 0,
+                    TotalInputTokens = inputTokens,
+                    TotalOutputTokens = outputTokens
+                };
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError("RestoreLastCodeGenerationResult", ex);
+            }
+        }
+
+        /// <summary>
+        /// Ensure LlmOrchestrationService is initialized with a valid API key.
+        /// Lazy-init so we don't fail at panel creation time if config isn't ready.
+        /// </summary>
+        private LlmOrchestrationService EnsureLlmService()
+        {
+            if (_llmService != null) return _llmService;
+
+            var (provider, apiKey, modelId) = ConfigService.GetActiveCredentials();
+            var compiler = GetCompiler();
+
+            if (provider == "local")
+            {
+                // Local self-hosted: gating is server URL, not API key (key optional).
+                var cfg = ConfigService.GetRagConfig();
+                if (string.IsNullOrWhiteSpace(cfg?.LocalServerUrl))
+                    throw new InvalidOperationException(
+                        "Local LLM server URL not configured. " +
+                        $"Open Settings ? Local LLM and enter your server URL for model '{modelId}'.");
+                _llmService = new LlmOrchestrationService(
+                    modelId, apiKey, compiler, cfg.LocalServerUrl, cfg.LocalModelName);
+            }
+            else
+            {
+                if (string.IsNullOrEmpty(apiKey))
+                    throw new InvalidOperationException(
+                        $"API key for provider '{provider}' not configured. " +
+                        $"Open Settings and add the matching key for model '{modelId}'.");
+                _llmService = new LlmOrchestrationService(modelId, apiKey, compiler);
+            }
+
+            // Wire streaming events to bridge
+            _llmService.OnStreamingDelta += (delta) =>
+            {
+                if (Volatile.Read(ref _suppressStreamingDeltaCount) == 0)
+                    _bridge.PostMessage("streaming_delta", delta);
+            };
+
+            _llmService.OnStatusUpdate += (status) =>
+            {
+                if (status != null)
+                    _bridge.PostMessage("progress", new[] {
+                        new { label = status, status = "active" }
+                    });
+                else
+                    _bridge.PostMessage("progress", new object[0]); // Clear progress UI
+            };
+
+            _llmService.OnTokenUsage += (info) =>
+            {
+                TokenTracker.Track("chat", _llmService.ProviderName, info.Model,
+                    info.InputTokens, info.OutputTokens, info.RequestId,
+                    info.CachedInputTokens, info.CacheCreationInputTokens);
+            };
+
+            Logger.Log("BibimDockablePanel",
+                $"LlmOrchestrationService initialized — provider={provider} model={modelId}");
+            return _llmService;
+        }
+
+        /// <summary>
+        /// Lightweight LLM instance for the Task Planner.
+        /// No streaming delta events — only token usage is tracked.
+        /// </summary>
+        private LlmOrchestrationService EnsurePlannerService()
+        {
+            if (_plannerLlmService != null) return _plannerLlmService;
+
+            var (provider, apiKey, modelId) = ConfigService.GetActiveCredentials();
+            var compiler = GetCompiler();
+
+            if (provider == "local")
+            {
+                var cfg = ConfigService.GetRagConfig();
+                if (string.IsNullOrWhiteSpace(cfg?.LocalServerUrl))
+                    throw new InvalidOperationException(
+                        "Local LLM server URL not configured. " +
+                        $"Open Settings ? Local LLM and enter your server URL for model '{modelId}'.");
+                _plannerLlmService = new LlmOrchestrationService(
+                    modelId, apiKey, compiler, cfg.LocalServerUrl, cfg.LocalModelName);
+            }
+            else
+            {
+                if (string.IsNullOrEmpty(apiKey))
+                    throw new InvalidOperationException(
+                        $"API key for provider '{provider}' not configured. " +
+                        $"Open Settings and add the matching key for model '{modelId}'.");
+                _plannerLlmService = new LlmOrchestrationService(modelId, apiKey, compiler);
+            }
+            _plannerLlmService.OnTokenUsage += (info) =>
+            {
+                TokenTracker.Track("task_planner", _plannerLlmService.ProviderName, info.Model,
+                    info.InputTokens, info.OutputTokens, info.RequestId,
+                    info.CachedInputTokens, info.CacheCreationInputTokens);
+            };
+
+            return _plannerLlmService;
+        }
+
+        /// <summary>
+        /// Returns a windowed slice of _chatHistory for LLM calls.
+        /// Keeps the most recent ChatHistoryMaxTurns messages and prepends a
+        /// single synthetic "[Earlier session context]" turn that summarises any
+        /// turns that were dropped — so the model still has a bird's-eye view
+        /// of long sessions without paying the per-turn token cost.
+        /// The full history is preserved in _chatHistory for session persistence.
+        /// </summary>
+        private List<ChatMessage> GetHistoryWindow()
+        {
+            lock (_chatHistoryLock)
+            {
+                if (_chatHistory.Count <= ChatHistoryMaxTurns)
+                    return _chatHistory.ToList();
+
+                int dropCount = _chatHistory.Count - ChatHistoryMaxTurns;
+                var dropped = _chatHistory.Take(dropCount).ToList();
+                var kept = _chatHistory.Skip(dropCount).ToList();
+
+                string summary = HistorySummariser.Summarise(dropped, _sessionContext);
+                if (string.IsNullOrEmpty(summary))
+                    return kept;
+
+                var window = new List<ChatMessage>(kept.Count + 1)
+                {
+                    new ChatMessage { Text = summary, IsUser = true }
+                };
+                window.AddRange(kept);
+                return window;
+            }
+        }
+
+        /// <summary>
+        /// Chat using LlmOrchestrationService with real SDK streaming.
+        /// Sends streaming_delta events for real-time UI updates,
+        /// then streaming_end with final text + token usage.
+        /// Also persists messages to the local session.
+        /// 
+        /// Integrates:
+        ///   - CodeGenSystemPrompt.Build(revitVersion) for Revit-aware prompts
+        ///   - @context tag resolution via RevitContextProvider
+        ///   - RAG document injection via CodeGenSystemPrompt.AppendRagContext
+        /// </summary>
+        private async Task ChatWithLlmServiceAsync(string userText)
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+
+            // Cancel any previous streaming
+            var ct = ReplaceCts();
+
+            try
+            {
+                EnsureActiveSession();
+                string resolvedText = ResolveContextTags(userText);
+                TaskPlanResponse plan = null;
+
+                // Heuristic gate: greetings / acks / very short non-actionable messages
+                // never need the ~2,500-token planner system prompt. Skip the LLM call
+                // entirely and route straight to chat. Only safe when there is no
+                // active task that the user might be answering.
+                var activeTask = GetActiveTask();
+                bool hasActiveTask = activeTask != null && !IsTaskTerminal(activeTask);
+                bool skipPlanner = PlannerGate.ShouldSkipPlanner(userText, hasActiveTask);
+
+                if (skipPlanner)
+                {
+                    Logger.Log("TaskPlanner",
+                        $"Gate skipped LLM call (msg=\"{userText?.Substring(0, Math.Min(userText?.Length ?? 0, 24))}...\")");
+                }
+                else
+                {
+                    try
+                    {
+                        plan = await PlanUserIntentAsync(userText, resolvedText, ct);
+                    }
+                    catch (Exception planEx)
+                    {
+                        Logger.Log("TaskPlanner", $"Falling back to direct chat: {planEx.Message}");
+                    }
+                }
+
+                lock (_chatHistoryLock) _chatHistory.Add(new ChatMessage { Text = resolvedText, IsUser = true });
+                _sessionManager?.AddMessage(_activeSessionId, "user", "text", userText);
+                SendSessionList();
+
+                if (plan == null || string.Equals(plan.Mode, "chat", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (plan != null && !string.IsNullOrWhiteSpace(plan.AssistantMessage))
+                    {
+                        SendAssistantMessage(plan.AssistantMessage);
+                    }
+                    else
+                    {
+                        await SendDirectChatResponseAsync(userText, resolvedText, sw, ct);
+                    }
+
+                    return;
+                }
+
+                await HandlePlannedTaskAsync(plan, userText, ct);
+            }
+            catch (OperationCanceledException)
+            {
+                _bridge.PostMessage("streaming_end", new
+                {
+                    text = UiText("Request cancelled.", "??? ???????."),
+                    type = "system",
+                    inputTokens = 0,
+                    outputTokens = 0,
+                    elapsedMs = sw.ElapsedMilliseconds
+                });
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError("ChatWithLlmService", ex);
+                _bridge.PostMessage("streaming_end", new
+                {
+                    text = $"Error: {ex.GetType().Name}: {ex.Message}",
+                    type = "error",
+                    inputTokens = 0,
+                    outputTokens = 0,
+                    elapsedMs = sw.ElapsedMilliseconds
+                });
+            }
+        }
+
+        private async Task SendDirectChatResponseAsync(
+            string userText, string resolvedText,
+            System.Diagnostics.Stopwatch sw,
+            CancellationToken ct)
+        {
+            var llm = EnsureLlmService();
+            string systemPrompt = await BuildSystemPromptWithRagAsync(resolvedText, false, ct);
+            var response = await llm.SendMessageAsync(GetHistoryWindow(), systemPrompt, ct, maxTokens: 4096);
+
+            if (response.Success)
+            {
+                SendAssistantMessage(response.Text, "text",
+                    response.InputTokens, response.OutputTokens);
+                return;
+            }
+
+            string chatErrMsg = response.IsContextLengthExceeded
+                ? UiText("The conversation is too long. Please start a new session and try again.",
+                         "??? ?? ??????. ? ??? ??? ? ?? ??? ???.")
+                : $"Error: {response.ErrorMessage}";
+
+            // Use SendAssistantMessage so the error is saved to _chatHistory and _sessionManager
+            SendAssistantMessage(chatErrMsg, "text", messageType: "error", elapsedMs: sw.ElapsedMilliseconds);
+        }
+
+        private async Task HandlePlannedTaskAsync(TaskPlanResponse plan, string userText, CancellationToken ct)
+        {
+            if (string.Equals(plan.TaskRelation, "ask", StringComparison.OrdinalIgnoreCase))
+            {
+                string askText = string.IsNullOrWhiteSpace(plan.AssistantMessage)
+                    ? UiText("Should I update the current task or start a new one?",
+                        "?? ??? ?????, ? ???? ??????")
+                    : plan.AssistantMessage;
+                SendAssistantMessage(askText, "question", messageType: "question");
+                return;
+            }
+
+            var activeTask = GetActiveTask();
+            bool updateExisting =
+                activeTask != null &&
+                !IsTaskTerminal(activeTask) &&
+                string.Equals(plan.TaskRelation, "update", StringComparison.OrdinalIgnoreCase);
+
+            var task = updateExisting ? activeTask : CreateTask(plan, userText);
+            if (updateExisting)
+                AppendTaskUserInput(task, userText);
+            ApplyPlanToTask(task, plan, userText);
+
+            if (IsBuiltInCurrentContextSummaryTaskV2(task))
+            {
+                ApplyCurrentContextSummaryDefaults(task);
+            }
+
+            ApplyParameterCreationGuard(task);
+
+            if (task.Questions != null && task.Questions.Count > 0)
+            {
+                task.Stage = TaskStages.NeedsDetails;
+                UpsertTask(task, autoOpen: true);
+                string questionText = BuildTaskQuestionsMessage(task);
+                SendAssistantMessage(questionText, "question", messageType: "question");
+                return;
+            }
+
+            if (IsBroadReadReviewTask(task))
+            {
+                task.Stage = TaskStages.Review;
+                UpsertTask(task, autoOpen: true);
+                string reviewText = BuildReadTaskReviewMessage(task);
+                SendAssistantMessage(reviewText, "question", messageType: "question");
+                return;
+            }
+
+            if (task.Kind == TaskKinds.Read && plan.ShouldAutoRun)
+            {
+                task.Stage = TaskStages.Working;
+                UpsertTask(task, autoOpen: true);
+                await GenerateCodeFromTaskAsync(task, runAfterGeneration: true);
+                return;
+            }
+
+            task.Stage = TaskStages.Review;
+            UpsertTask(task, autoOpen: true);
+        }
+
+        /// <summary>
+        /// Build system prompt using CodeGenSystemPrompt with Revit version + RAG context.
+        /// Design doc §2.2 — system prompt includes Revit version and verified API docs.
+        /// </summary>
+        private string BuildSystemPrompt(bool isCodeGeneration)
+        {
+            string revitVersion = ConfigService.GetEffectiveRevitVersion();
+            return CodeGenSystemPrompt.Build(revitVersion, isCodeGeneration);
+        }
+
+        /// <summary>
+        /// Build system prompt for plain chat (non-code-gen).
+        /// </summary>
+        private Task<string> BuildSystemPromptWithRagAsync(
+            string queryContext, bool isCodeGeneration, CancellationToken ct)
+        {
+            string revitVersion = ConfigService.GetEffectiveRevitVersion();
+            return Task.FromResult(CodeGenSystemPrompt.Build(revitVersion, isCodeGeneration));
+        }
+
+        /// <summary>
+        /// Resolve @context tags in user message text.
+        /// Replaces @view, @selection, @levels, etc. with live Revit data.
+        /// Design doc §1 — @Context Picker integration.
+        /// </summary>
+        private string ResolveContextTags(string userText)
+        {
+            if (string.IsNullOrEmpty(userText) || !userText.Contains("@"))
+                return userText;
+
+            // Initialize context provider if needed
+            EnsureContextProvider();
+            if (_contextProvider == null)
+                return userText; // No Revit context available (e.g., no active document)
+
+            // Match @tag patterns: @view, @selection, @levels, @worksets, @phases, @family:xxx, @parameters:xxx
+            return Regex.Replace(userText, @"@(\w+)(?::([^\s]+))?", match =>
+            {
+                string fullTag = match.Value;
+                try
+                {
+                    string resolved = _contextProvider.ResolveContextTag(fullTag);
+                    if (!string.IsNullOrEmpty(resolved) && resolved != fullTag)
+                    {
+                        Logger.Log("ContextResolve", $"Resolved {fullTag} ? {resolved.Length} chars");
+                        return $"\n[Context: {fullTag}]\n{resolved}\n";
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logger.Log("ContextResolve", $"Failed to resolve {fullTag}: {ex.Message}");
+                }
+                return fullTag; // Return original if resolution fails
+            });
+        }
+
+        /// <summary>
+        /// Ensure RevitContextProvider is initialized with UIApplication.
+        /// Gets UIApplication from BibimApp's execution context.
+        /// </summary>
+        private void EnsureContextProvider()
+        {
+            if (_contextProvider != null) return;
+
+            _contextProvider = ServiceContainer.GetService<RevitContextProvider>();
+            if (_contextProvider == null)
+            {
+                // Create a new one — UIApplication will be set when available
+                _contextProvider = new RevitContextProvider();
+                Logger.Log("BibimDockablePanel", "RevitContextProvider created (UIApplication pending)");
+            }
+        }
+
+        // Fetch the process-wide RoslynCompilerService. BibimApp.OnStartup registers
+        // it eagerly; we fall back to `new` only when the panel is constructed before
+        // the container is initialized (test harness / linked-source builds), since
+        // RoslynCompilerService's ctor scans AppDomain assemblies (~100-300ms) and we
+        // do not want that cost on every chat turn / rerun.
+        private static RoslynCompilerService GetCompiler()
+        {
+            return ServiceContainer.GetService<RoslynCompilerService>()
+                ?? new RoslynCompilerService();
+        }
+
+        // Whitelist of hosts that the auto-update handler is allowed to fetch from.
+        // VersionChecker reads release metadata from api.github.com; the asset URL
+        // GitHub returns lives at objects.githubusercontent.com; release HTML pages
+        // (the fallback when no matching asset is found) live at github.com.
+        // Anything else is rejected — even if a future server-side bug or compromise
+        // points us at a different domain, the installer download stays off it.
+        private static readonly string[] _trustedReleaseAssetHosts =
+        {
+            "github.com",
+            "objects.githubusercontent.com"
+        };
+
+        private static bool IsTrustedReleaseAssetUrl(string url, out string reason)
+        {
+            reason = null;
+            if (string.IsNullOrWhiteSpace(url))
+            {
+                reason = "empty";
+                return false;
+            }
+            if (!Uri.TryCreate(url, UriKind.Absolute, out var uri))
+            {
+                reason = "not an absolute URI";
+                return false;
+            }
+            if (!string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+            {
+                reason = $"scheme '{uri.Scheme}' is not https";
+                return false;
+            }
+            string host = uri.Host;
+            foreach (var allowed in _trustedReleaseAssetHosts)
+            {
+                if (host.Equals(allowed, StringComparison.OrdinalIgnoreCase) ||
+                    host.EndsWith("." + allowed, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+            reason = $"host '{host}' not in trusted list";
+            return false;
+        }
+
+        private static string Truncate(string s, int max)
+        {
+            if (string.IsNullOrEmpty(s) || s.Length <= max) return s ?? string.Empty;
+            return s.Substring(0, max) + "…";
+        }
+
+        /// <summary>
+        /// Create a BibimToolService wired to the current Revit context and Roslyn services.
+        /// The mainThreadInvoker dispatches RevitContext calls to the WPF/Revit main thread.
+        /// </summary>
+        private BibimToolService CreateToolService()
+        {
+            EnsureContextProvider();
+            return new BibimToolService(
+                _contextProvider,
+                GetCompiler(),
+                _analyzerService,
+                async func =>
+                {
+                    using (var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromSeconds(10)))
+                    {
+                        try
+                        {
+                            return await System.Windows.Application.Current.Dispatcher.InvokeAsync(
+                                func,
+                                System.Windows.Threading.DispatcherPriority.Normal,
+                                cts.Token);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            Logger.Log("Dispatcher", "Timeout (>10s): Revit main thread was busy.");
+                            return "[Tool Error] Dispatcher timeout: Revit main thread was busy for over 10 seconds.";
+                        }
+                    }
+                });
+        }
+
+        /// <summary>
+        /// Extract a lightweight spec payload from a structured assistant response.
+        /// This enables the SpecCard flow without requiring a separate backend step.
+        /// </summary>
+        private object TryExtractSpec(string responseText)
+        {
+            if (string.IsNullOrWhiteSpace(responseText))
+                return null;
+
+            var lines = responseText
+                .Split(new[] { "\r\n", "\n" }, StringSplitOptions.None)
+                .Select(line => line.Trim())
+                .Where(line => !string.IsNullOrWhiteSpace(line))
+                .ToList();
+
+            if (lines.Count == 0)
+                return null;
+
+            var stepPrefixes = new[] { "-", "*", "•", "1.", "2.", "3.", "4.", "5." };
+            var steps = lines
+                .Where(line => stepPrefixes.Any(prefix => line.StartsWith(prefix, StringComparison.Ordinal)))
+                .Select(line => line.TrimStart('-', '*', '•', ' ').Trim())
+                .Select(line =>
+                {
+                    int dotIndex = line.IndexOf('.');
+                    if (dotIndex > 0 && dotIndex < 3 && line.Take(dotIndex).All(char.IsDigit))
+                        return line.Substring(dotIndex + 1).Trim();
+                    return line;
+                })
+                .Where(line => !string.IsNullOrWhiteSpace(line))
+                .Take(8)
+                .ToList();
+
+            bool hasSpecCue =
+                responseText.IndexOf("spec", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                responseText.IndexOf("plan", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                responseText.IndexOf("requirements", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                responseText.IndexOf("??", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                responseText.IndexOf("??", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                responseText.IndexOf("????", StringComparison.OrdinalIgnoreCase) >= 0;
+
+            if (!hasSpecCue && steps.Count < 2)
+                return null;
+
+            string title = lines[0].TrimStart('#', '-', '*', '•', ' ').Trim();
+            if (title.Length > 80)
+                title = title.Substring(0, 80).Trim();
+
+            string description = lines
+                .Skip(1)
+                .FirstOrDefault(line => !stepPrefixes.Any(prefix => line.StartsWith(prefix, StringComparison.Ordinal)))
+                ?? "Review this proposed plan before generating code.";
+
+            if (description.Length > 240)
+                description = description.Substring(0, 240).Trim();
+
+            return new
+            {
+                title,
+                description,
+                steps = steps.ToArray(),
+                status = "pending"
+            };
+        }
+
+        private async Task GenerateCodeFromTaskAsync(TaskState task, bool runAfterGeneration, string additionalContext = null)
+        {
+            var ct = ReplaceCts();
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            bool suppressStreaming = task != null;
+            string debugDirectory = null;
+
+            try
+            {
+                if (suppressStreaming)
+                    Interlocked.Increment(ref _suppressStreamingDeltaCount);
+
+                if (task == null)
+                    throw new InvalidOperationException("No active task to generate.");
+
+                var llm = EnsureLlmService();
+                string taskPrompt = BuildTaskExecutionPrompt(task);
+                if (!string.IsNullOrWhiteSpace(additionalContext))
+                {
+                    string trimmedContext = additionalContext.Length > BibimConstants.AdditionalContextMaxChars
+                        ? additionalContext.Substring(0, BibimConstants.AdditionalContextMaxChars) +
+                          "\n[...additional context truncated]"
+                        : additionalContext;
+                    taskPrompt += $"\n\n[Additional context]\n{trimmedContext}";
+                }
+                string revitVersion = ConfigService.GetEffectiveRevitVersion();
+
+                // Only include the ~700-token FileOutputRules block when the task
+                // actually produces files. Most tasks (parameter edits, geometry
+                // moves, view tweaks) don't, so this saves a large chunk per call.
+                bool isFileOutput =
+                    CodeGenSystemPrompt.LooksLikeFileOutputTask(task?.Title) ||
+                    CodeGenSystemPrompt.LooksLikeFileOutputTask(task?.Summary) ||
+                    CodeGenSystemPrompt.LooksLikeFileOutputTask(task?.SourceUserMessage) ||
+                    CodeGenSystemPrompt.LooksLikeFileOutputTask(taskPrompt);
+
+                string systemPrompt = CodeGenSystemPrompt.Build(revitVersion, true, isFileOutput)
+                    + CodeGenSystemPrompt.AppendToolUseInstructions();
+                debugDirectory = CodegenDebugRecorder.CreateRunDirectory(task.TaskId, Guid.NewGuid().ToString("N").Substring(0, 8), "task_codegen");
+                CodegenDebugRecorder.WriteJson(debugDirectory, "task_snapshot.json", CreateTaskDebugSnapshot(task));
+                CodegenDebugRecorder.WriteText(debugDirectory, "task_prompt.txt", taskPrompt);
+                CodegenDebugRecorder.WriteText(debugDirectory, "system_prompt.txt", systemPrompt);
+
+                _analyzerService.SetRevitVersion(revitVersion);
+
+                var generationHistory = new List<ChatMessage>(GetHistoryWindow())
+                {
+                    new ChatMessage { Text = taskPrompt, IsUser = true }
+                };
+
+                // Build a context hint so we only ship Revit-context tools
+                // (get_view_info, get_selected_elements, etc.) when the task text
+                // actually mentions matching keywords.
+                string toolHint = string.Join(" ",
+                    task?.Title ?? "",
+                    task?.Summary ?? "",
+                    task?.SourceUserMessage ?? "",
+                    taskPrompt ?? "");
+
+                var agentResult = await llm.GenerateWithToolsAsync(
+                    generationHistory, systemPrompt,
+                    BibimToolService.GetToolDefinitions(toolHint),
+                    CreateToolService().ExecuteAsync,
+                    maxTurns: 15, debugDirectory, ct);
+
+                _lastCodeGenResult = agentResult;
+
+                if (!agentResult.Success)
+                {
+                    task.Stage = TaskStages.Review;
+                    string failMsg = agentResult.IsContextLengthExceeded
+                        ? UiText("The conversation is too long. Please start a new session and try again.",
+                                 "??? ?? ??????. ? ??? ??? ? ?? ??? ???.")
+                        : agentResult.ErrorMessage ?? "Code generation failed.";
+                    task.ResultSummary = failMsg;
+                    UpsertTask(task, autoOpen: true);
+                    SendAssistantMessage(failMsg, "text",
+                        agentResult.TotalInputTokens, agentResult.TotalOutputTokens,
+                        messageType: "error");
+                    return;
+                }
+
+                if (!agentResult.IsCodeResponse)
+                {
+                    task.Stage = TaskStages.Completed;
+                    task.ResultSummary = agentResult.RawResponse;
+                    UpsertTask(task, autoOpen: false);
+                    SendAssistantMessage(agentResult.RawResponse, "text",
+                        agentResult.TotalInputTokens, agentResult.TotalOutputTokens);
+                    return;
+                }
+
+                string codeToCompile = agentResult.GeneratedCode;
+                var compileResult = agentResult.CompilationResult;
+                var validationConfig = ConfigService.GetRagConfig();
+                bool validationEnabled = validationConfig?.ValidationGateEnabled ?? true;
+                bool verifyStageEnabled = validationConfig?.VerifyStageEnabled ?? false;
+                var analyzerReport = _analyzerService.Analyze(codeToCompile);
+
+                task.GeneratedCode = codeToCompile;
+                task.Stage = TaskStages.Working;
+                UpsertTask(task, autoOpen: runAfterGeneration);
+
+                // Save to code library
+                try
+                {
+                    var snippet = new CodeSnippet
+                    {
+                        Title = task.Title ?? "",
+                        Summary = task.Summary ?? "",
+                        Code = codeToCompile,
+                        RevitVersion = ConfigService.GetEffectiveRevitVersion(),
+                        TaskKind = task.Kind ?? TaskKinds.Write,
+                        SourceSessionId = _activeSessionId
+                    };
+                    _pendingLibrarySnippetId = snippet.Id;
+                    _codeLibrary?.Save(snippet);
+                    _bridge?.PostMessage("code_library_updated", new object());
+                }
+                catch (Exception libEx)
+                {
+                    Logger.Log("CodeLibrary", $"Save failed: {libEx.Message}");
+                    _pendingLibrarySnippetId = null;
+                }
+
+                if (task.Kind == TaskKinds.Read)
+                {
+                    var execResult = await ExecuteCompiledCodeAsync(isDryRun: true);
+                    var report = InspectGeneratedCode(codeToCompile, execResult);
+                    BindTaskToExecutedDocument(task, execResult);
+
+                    // Record execution result in session log
+                    if (_sessionContext != null)
+                    {
+                        _sessionContext.RecordExecution(new ExecutionLogEntry
+                        {
+                            TaskId = task.TaskId,
+                            TaskTitle = task.Title,
+                            Success = execResult.Success,
+                            Output = execResult.Success ? execResult.Output : null,
+                            ErrorMessage = execResult.ErrorMessage,
+                            IsDryRun = true
+                        });
+                        SaveSessionContext();
+                    }
+
+                    task.ExecutionSuccess = execResult.Success;
+                    task.Review = BuildTaskReviewSummary(report, execResult);
+                    task.Stage = execResult.Success ? TaskStages.Completed : TaskStages.Review;
+                    task.ResultSummary = execResult.Success
+                        ? execResult.Output
+                        : $"Execution failed: {execResult.ErrorMessage}";
+                    UpsertTask(task, autoOpen: true);
+                    SendAssistantMessage(task.ResultSummary, "text",
+                        _lastCodeGenResult?.TotalInputTokens ?? 0,
+                        _lastCodeGenResult?.TotalOutputTokens ?? 0,
+                        codeToCompile,
+                        messageType: execResult.Success ? "normal" : "error");
+                    return;
+                }
+
+                if (runAfterGeneration)
+                {
+                    var previewResult = await ExecuteCompiledCodeAsync(isDryRun: true);
+                    var report = InspectGeneratedCode(codeToCompile, previewResult);
+                    BindTaskToExecutedDocument(task, previewResult);
+
+                    // Record preview execution result in session log
+                    if (_sessionContext != null)
+                    {
+                        _sessionContext.RecordExecution(new ExecutionLogEntry
+                        {
+                            TaskId = task.TaskId,
+                            TaskTitle = task.Title,
+                            Success = previewResult.Success,
+                            Output = previewResult.Success ? previewResult.Output : null,
+                            ErrorMessage = previewResult.ErrorMessage,
+                            IsDryRun = true
+                        });
+                        SaveSessionContext();
+                    }
+
+                    task.Review = BuildTaskReviewSummary(report, previewResult);
+                    task.Stage = TaskStages.PreviewReady;
+                    task.ResultSummary = previewResult.Success
+                        ? UiText("Preview completed. Review the result before applying changes.",
+                            "?? ??? ???????. ??? ??? ? ?? ?????.")
+                        : $"Preview failed: {previewResult.ErrorMessage}";
+                    UpsertTask(task, autoOpen: true);
+
+                    if (!previewResult.Success)
+                    {
+                        SendAssistantMessage(task.ResultSummary, "text",
+                            _lastCodeGenResult?.TotalInputTokens ?? 0,
+                            _lastCodeGenResult?.TotalOutputTokens ?? 0,
+                            codeToCompile,
+                            messageType: "error",
+                            elapsedMs: sw.ElapsedMilliseconds);
+                    }
+                    else
+                    {
+                        SendAssistantMessage(task.ResultSummary, "text",
+                            _lastCodeGenResult?.TotalInputTokens ?? 0,
+                            _lastCodeGenResult?.TotalOutputTokens ?? 0,
+                            codeToCompile,
+                            messageType: "system",
+                            elapsedMs: sw.ElapsedMilliseconds);
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                string cancelledText = UiText("Code generation cancelled.", "?? ??? ???????.");
+                SendAssistantMessage(cancelledText, "text", messageType: "system");
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError("GenerateCodeFromTask", ex);
+                string errorText = $"Error: {ex.Message}";
+                SendAssistantMessage(errorText, "text", messageType: "error");
+            }
+            finally
+            {
+                if (suppressStreaming)
+                    Interlocked.Decrement(ref _suppressStreamingDeltaCount);
+                _bridge.PostMessage("progress", new object[0]);
+            }
+        }
+
+        /// <summary>
+        /// Generate code from the confirmed spec using the agent loop.
+        /// Stores the result for later execute (dryrun/commit).
+        /// 
+        /// Integrates:
+        ///   - CodeGenSystemPrompt.Build(revitVersion, isCodeGeneration: true)
+        ///   - GenerateWithToolsAsync (Claude Tool Use loop with auto-compile)
+        ///   - RoslynAnalyzerService (Bibim001-005) for post-compile analysis
+        /// </summary>
+        private async Task GenerateCodeFromSpecAsync()
+        {
+            var ct = ReplaceCts();
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            Interlocked.Increment(ref _suppressStreamingDeltaCount);
+
+            try
+            {
+                var llm = EnsureLlmService();
+
+                string revitVersion2 = ConfigService.GetEffectiveRevitVersion();
+
+                // Inspect the last few user messages for file-output keywords
+                // (no task object here — spec flow drives codegen straight from chat history).
+                bool specIsFileOutput = false;
+                lock (_chatHistoryLock)
+                {
+                    int scan = Math.Min(_chatHistory.Count, 6);
+                    for (int i = _chatHistory.Count - scan; i < _chatHistory.Count; i++)
+                    {
+                        if (i < 0) continue;
+                        if (_chatHistory[i].IsUser &&
+                            CodeGenSystemPrompt.LooksLikeFileOutputTask(_chatHistory[i].Text))
+                        {
+                            specIsFileOutput = true;
+                            break;
+                        }
+                    }
+                }
+
+                string systemPrompt = CodeGenSystemPrompt.Build(revitVersion2, true, specIsFileOutput)
+                    + CodeGenSystemPrompt.AppendToolUseInstructions();
+
+                _analyzerService.SetRevitVersion(revitVersion2);
+
+                // Use windowed history to cap token cost across the multi-turn tool loop
+                var specHistory = new List<ChatMessage>(GetHistoryWindow());
+
+                string specDebugDir = CodegenDebugRecorder.CreateRunDirectory(
+                    "spec", Guid.NewGuid().ToString("N").Substring(0, 8), "spec_codegen");
+                CodegenDebugRecorder.WriteText(specDebugDir, "system_prompt.txt", systemPrompt);
+
+                // Use the most recent user message(s) as the tool-hint so we only
+                // ship Revit-context tools that the spec actually needs.
+                string specToolHint = string.Join(" ",
+                    specHistory.Where(m => m.IsUser).Select(m => m.Text ?? "").Reverse().Take(3));
+
+                var agentResult = await llm.GenerateWithToolsAsync(
+                    specHistory, systemPrompt,
+                    BibimToolService.GetToolDefinitions(specToolHint),
+                    CreateToolService().ExecuteAsync,
+                    maxTurns: 15, specDebugDir, ct);
+
+                _lastCodeGenResult = agentResult;
+
+                if (!agentResult.Success)
+                {
+                    string specFailMsg = agentResult.IsContextLengthExceeded
+                        ? UiText("The conversation is too long. Please start a new session and try again.",
+                                 "??? ?? ??????. ? ??? ??? ? ?? ??? ???.")
+                        : agentResult.ErrorMessage ?? "Code generation failed.";
+                    _bridge.PostMessage("streaming_end", new
+                    {
+                        text = specFailMsg,
+                        type = "error",
+                        inputTokens = agentResult.TotalInputTokens,
+                        outputTokens = agentResult.TotalOutputTokens,
+                        elapsedMs = sw.ElapsedMilliseconds
+                    });
+                    return;
+                }
+
+                if (!agentResult.IsCodeResponse)
+                {
+                    lock (_chatHistoryLock) _chatHistory.Add(new ChatMessage { Text = agentResult.RawResponse, IsUser = false });
+                    _bridge.PostMessage("streaming_end", new
+                    {
+                        text = agentResult.RawResponse,
+                        type = "normal",
+                        inputTokens = agentResult.TotalInputTokens,
+                        outputTokens = agentResult.TotalOutputTokens,
+                        elapsedMs = sw.ElapsedMilliseconds
+                    });
+                    return;
+                }
+
+                // Add assistant's code response to history so subsequent turns have context
+                lock (_chatHistoryLock) _chatHistory.Add(new ChatMessage { Text = agentResult.RawResponse, IsUser = false });
+
+                string codeToCompile = agentResult.GeneratedCode;
+                var compileResult = agentResult.CompilationResult;
+                var validationConfig = ConfigService.GetRagConfig();
+                bool validationEnabled = validationConfig?.ValidationGateEnabled ?? true;
+                bool verifyStageEnabled = validationConfig?.VerifyStageEnabled ?? false;
+                var analyzerReport = _analyzerService.Analyze(codeToCompile);
+
+                PostStreamingEndMessage(
+                    UiText("Code generation completed. Review the results before applying changes.",
+                        "?? ??? ???????. ?? ??? ??? ? ?? ?? ??? ?????."),
+                    "system",
+                    inputTokens: agentResult.TotalInputTokens,
+                    outputTokens: agentResult.TotalOutputTokens,
+                    elapsedMs: sw.ElapsedMilliseconds);
+
+                // Run API inspection with analyzer integration
+                var inspector = new ApiInspectorService(
+                    validationEnabled || verifyStageEnabled ? _analyzerService : null,
+                    ConfigService.GetEffectiveRevitVersion());
+                var report = inspector.Inspect(codeToCompile);
+                _bridge.PostMessage("api_report", new
+                {
+                    apiUsages = report.ApiUsages.Select(u => new
+                    {
+                        apiName = u.ApiName,
+                        fullExpression = u.FullExpression,
+                        status = u.Status.ToString().ToLower(),
+                        note = u.Note,
+                        line = u.Line
+                    }),
+                    safeCount = report.SafeCount,
+                    versionSpecificCount = report.VersionSpecificCount,
+                    deprecatedCount = report.DeprecatedCount,
+                    analyzerDiagnostics = analyzerReport.Diagnostics.Select(d => new
+                    {
+                        id = d.Id,
+                        message = d.Message,
+                        severity = d.Severity.ToString().ToLower(),
+                        line = d.Line
+                    })
+                });
+            }
+            catch (OperationCanceledException)
+            {
+                _bridge.PostMessage("streaming_end", new
+                {
+                    text = UiText("Code generation cancelled.", "?? ??? ???????."),
+                    type = "system",
+                    inputTokens = 0,
+                    outputTokens = 0,
+                    elapsedMs = sw.ElapsedMilliseconds
+                });
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError("GenerateCodeFromSpec", ex);
+                _bridge.PostMessage("streaming_end", new
+                {
+                    text = $"Error: {ex.Message}",
+                    type = "error",
+                    inputTokens = 0,
+                    outputTokens = 0,
+                    elapsedMs = sw.ElapsedMilliseconds
+                });
+            }
+            finally
+            {
+                Interlocked.Decrement(ref _suppressStreamingDeltaCount);
+            }
+        }
+    }
+}
