@@ -102,7 +102,7 @@ export default function App() {
           >
             {'</>'}
           </button>
-          <img src="./bibim-icon.png" alt="SaraIA" style={{ width: 18, height: 18 }} />
+          <img src="./saraia-icon.svg" alt="SaraIA" style={{ width: 18, height: 18 }} />
           <span style={{
             fontSize: 'var(--text-base)',
             fontWeight: 600,

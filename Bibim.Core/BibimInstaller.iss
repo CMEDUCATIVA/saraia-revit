@@ -28,8 +28,8 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 WizardStyle=modern
 LicenseFile=..\LICENSE
-SetupIconFile=Assets\Icons\Bibim-icon-blue.ico
-UninstallDisplayIcon={app}\Bibim-icon-blue.ico
+SetupIconFile=Assets\Icons\SaraIA-icon.ico
+UninstallDisplayIcon={app}\SaraIA-icon.ico
 PrivilegesRequired=admin
 
 [Languages]
@@ -43,7 +43,7 @@ Source: "bin\Release\2024\*"; DestDir: "{app}\2024"; Flags: ignoreversion recurs
 Source: "bin\Release\2023\*"; DestDir: "{app}\2023"; Flags: ignoreversion recursesubdirs skipifsourcedoesntexist
 Source: "bin\Release\2022\*"; DestDir: "{app}\2022"; Flags: ignoreversion recursesubdirs skipifsourcedoesntexist
 Source: "redist\MicrosoftEdgeWebview2Setup.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall
-Source: "Assets\Icons\Bibim-icon-blue.ico"; DestDir: "{app}"; Flags: ignoreversion
+Source: "Assets\Icons\SaraIA-icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "wwwroot\*"; DestDir: "{app}\wwwroot"; Flags: ignoreversion recursesubdirs
 Source: "Config\*"; DestDir: "{app}\Config"; Flags: ignoreversion recursesubdirs
 

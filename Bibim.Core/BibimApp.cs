@@ -274,8 +274,8 @@ namespace Bibim.Core
                     Path.GetDirectoryName(assemblyPath) ?? "",
                     "Assets", "Icons");
 
-                string icon32 = Path.Combine(iconDir, "Bibim-icon-32.png");
-                string icon16 = Path.Combine(iconDir, "Bibim-icon-16.png");
+                string icon32 = Path.Combine(iconDir, "SaraIA-icon-32.png");
+                string icon16 = Path.Combine(iconDir, "SaraIA-icon-16.png");
 
                 if (File.Exists(icon32))
                     showPanelBtn.LargeImage = new BitmapImage(new Uri(icon32));

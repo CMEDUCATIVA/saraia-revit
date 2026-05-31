@@ -67,7 +67,7 @@ export default function ChatPanel({
             alignItems: 'center', justifyContent: 'center',
             height: '100%', gap: 'var(--space-md)',
           }}>
-            <img src="./Bibim-icon.png" alt="SaraIA" style={{ width: 40, height: 40 }} />
+            <img src="./saraia-icon.svg" alt="SaraIA" style={{ width: 40, height: 40 }} />
             <div style={{
               fontSize: 'var(--text-lg)', fontWeight: 600,
               color: 'var(--color-accent)',

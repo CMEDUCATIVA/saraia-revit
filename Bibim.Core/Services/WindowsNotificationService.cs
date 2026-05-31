@@ -77,7 +77,7 @@ namespace Bibim.Core
             {
                 string assemblyDir = Path.GetDirectoryName(
                     Assembly.GetExecutingAssembly().Location) ?? "";
-                string icoPath = Path.Combine(assemblyDir, "Assets", "Icons", "Bibim-icon-blue.ico");
+                string icoPath = Path.Combine(assemblyDir, "Assets", "Icons", "SaraIA-icon.ico");
 
                 if (File.Exists(icoPath))
                     return new Icon(icoPath);
