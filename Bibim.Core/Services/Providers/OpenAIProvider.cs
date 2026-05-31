@@ -108,6 +108,9 @@ namespace Bibim.Core
             CancellationToken ct,
             int maxTokens)
         {
+            if (IsCodexModel(_modelId))
+                return await SendResponsesAsSingleDeltaAsync(messages, systemPrompt, onTextDelta, ct, maxTokens);
+
             // For chat-only streaming (no tools), use Chat Completions API — simpler SSE format.
             var chatMessages = new JArray();
             if (!string.IsNullOrEmpty(systemPrompt))
@@ -408,6 +411,45 @@ namespace Bibim.Core
                 ["usage"] = usage,
                 ["model"] = openAiResponse["model"] ?? ""
             };
+        }
+
+        /// <summary>
+        /// Run Responses-only models through the same API used for tool calls,
+        /// then emit the final response as a single UI delta.
+        /// </summary>
+        private async Task<StreamResult> SendResponsesAsSingleDeltaAsync(
+            JArray messages,
+            string systemPrompt,
+            Action<string> onTextDelta,
+            CancellationToken ct,
+            int maxTokens)
+        {
+            var response = await SendNonStreamingAsync(
+                messages,
+                systemPrompt,
+                tools: null,
+                ct,
+                maxTokens,
+                jsonMode: false);
+
+            string text = ExtractTextFromAnthropicContent(response["content"]);
+            if (!string.IsNullOrEmpty(text))
+                onTextDelta?.Invoke(text);
+
+            var usage = response["usage"];
+            return new StreamResult
+            {
+                FullText = text ?? string.Empty,
+                InputTokens = usage?["input_tokens"]?.Value<int>() ?? 0,
+                OutputTokens = usage?["output_tokens"]?.Value<int>() ?? 0,
+                CachedInputTokens = usage?["cache_read_input_tokens"]?.Value<int>() ?? 0
+            };
+        }
+
+        private static bool IsCodexModel(string modelId)
+        {
+            return !string.IsNullOrWhiteSpace(modelId)
+                && modelId.IndexOf("codex", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
         /// <summary>

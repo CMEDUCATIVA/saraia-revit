@@ -17,6 +17,7 @@ type ModelNoteKey =
   | 'modelNoteSonnet'
   | 'modelNoteOpus47'
   | 'modelNoteGpt55'
+  | 'modelNoteCodex'
   | 'modelNoteGemini31Pro'
   | 'modelNoteLocalIdle';
 
@@ -36,6 +37,9 @@ const MODELS: ReadonlyArray<{
   { id: 'claude-sonnet-4-6',     label: 'Claude Sonnet 4.6', cost: '~$0.04', speed: '⚡⚡⚡', speedKey: 'modelSpeedFast',   noteKey: 'modelNoteSonnet',       provider: 'anthropic', recommended: true },
   { id: 'claude-opus-4-7',       label: 'Claude Opus 4.7',   cost: '~$0.20', speed: '⚡⚡',  speedKey: 'modelSpeedMedium', noteKey: 'modelNoteOpus47',       provider: 'anthropic' },
   { id: 'gpt-5.5',                label: 'GPT-5.5',           cost: '~$0.08', speed: '⚡⚡',  speedKey: 'modelSpeedMedium', noteKey: 'modelNoteGpt55',        provider: 'openai' },
+  { id: 'gpt-5.2-codex',          label: 'GPT-5.2 Codex',     cost: 'API',    speed: '⚡',    speedKey: 'modelSpeedSlow',   noteKey: 'modelNoteCodex',        provider: 'openai' },
+  { id: 'gpt-5.1-codex',          label: 'GPT-5.1 Codex',     cost: 'API',    speed: '⚡',    speedKey: 'modelSpeedSlow',   noteKey: 'modelNoteCodex',        provider: 'openai' },
+  { id: 'gpt-5.1-codex-mini',     label: 'GPT-5.1 Codex mini', cost: 'API',   speed: '⚡⚡',  speedKey: 'modelSpeedMedium', noteKey: 'modelNoteCodex',        provider: 'openai' },
   { id: 'deepseek-v4-flash',      label: 'DeepSeek V4 Flash', cost: '~$0.02', speed: '⚡⚡',  speedKey: 'modelSpeedMedium', noteKey: 'modelNoteGpt55',        provider: 'deepseek' },
   { id: 'deepseek-v4-pro',        label: 'DeepSeek V4 Pro',   cost: '~$0.06', speed: '⚡',    speedKey: 'modelSpeedSlow',   noteKey: 'modelNoteGpt55',        provider: 'deepseek' },
   { id: 'deepseek-coder',         label: 'DeepSeek Coder',    cost: '~$0.02', speed: '⚡⚡',  speedKey: 'modelSpeedMedium', noteKey: 'modelNoteGpt55',        provider: 'deepseek' },

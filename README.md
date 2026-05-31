@@ -43,6 +43,9 @@ La lista exacta puede cambiar segun la configuracion del proyecto, pero la app y
 | Claude Sonnet | Anthropic |
 | Claude Opus | Anthropic |
 | GPT | OpenAI |
+| GPT-5.2 Codex | OpenAI |
+| GPT-5.1 Codex | OpenAI |
+| GPT-5.1 Codex mini | OpenAI |
 | DeepSeek V4 Flash | DeepSeek |
 | DeepSeek V4 Pro | DeepSeek |
 | DeepSeek Coder | DeepSeek |
@@ -73,6 +76,7 @@ Recomendacion practica:
 
 - Usa DeepSeek si quieres una opcion economica y rapida.
 - Usa DeepSeek Coder si quieres priorizar generacion y correccion de codigo C#/Revit.
+- Usa GPT Codex si quieres un modelo OpenAI optimizado para programacion y tareas agenticas.
 - Usa Claude para tareas complejas y razonamiento cuidadoso.
 - Usa OpenAI si ya trabajas con su ecosistema.
 - Usa Gemini si necesitas contexto amplio.
