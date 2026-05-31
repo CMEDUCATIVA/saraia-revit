@@ -38,6 +38,7 @@ const MODELS: ReadonlyArray<{
   { id: 'gpt-5.5',                label: 'GPT-5.5',           cost: '~$0.08', speed: '⚡⚡',  speedKey: 'modelSpeedMedium', noteKey: 'modelNoteGpt55',        provider: 'openai' },
   { id: 'deepseek-v4-flash',      label: 'DeepSeek V4 Flash', cost: '~$0.02', speed: '⚡⚡',  speedKey: 'modelSpeedMedium', noteKey: 'modelNoteGpt55',        provider: 'deepseek' },
   { id: 'deepseek-v4-pro',        label: 'DeepSeek V4 Pro',   cost: '~$0.06', speed: '⚡',    speedKey: 'modelSpeedSlow',   noteKey: 'modelNoteGpt55',        provider: 'deepseek' },
+  { id: 'deepseek-coder',         label: 'DeepSeek Coder',    cost: '~$0.02', speed: '⚡⚡',  speedKey: 'modelSpeedMedium', noteKey: 'modelNoteGpt55',        provider: 'deepseek' },
   { id: 'deepseek-chat',          label: 'DeepSeek Chat',     cost: '~$0.02', speed: '⚡⚡',  speedKey: 'modelSpeedMedium', noteKey: 'modelNoteGpt55',        provider: 'deepseek' },
   { id: 'gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro',    cost: '~$0.03', speed: '⚡',    speedKey: 'modelSpeedSlow',   noteKey: 'modelNoteGemini31Pro',  provider: 'gemini' },
   // Self-hosted local LLM — single entry. The active server-side model name is

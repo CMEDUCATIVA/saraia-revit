@@ -59,6 +59,7 @@ namespace Bibim.Core
             ("gpt-5.5",                     "GPT-5.5",            "openai"),
             ("deepseek-v4-flash",           "DeepSeek V4 Flash",  "deepseek"),
             ("deepseek-v4-pro",             "DeepSeek V4 Pro",    "deepseek"),
+            ("deepseek-coder",              "DeepSeek Coder",     "deepseek"),
             ("deepseek-chat",               "DeepSeek Chat",      "deepseek"),
             // Vanilla 3.1 Pro � the customtools variant silently misbehaves
             // on JSON-only output without registered tools (planner case).

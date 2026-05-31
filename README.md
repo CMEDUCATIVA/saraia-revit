@@ -45,6 +45,7 @@ La lista exacta puede cambiar segun la configuracion del proyecto, pero la app y
 | GPT | OpenAI |
 | DeepSeek V4 Flash | DeepSeek |
 | DeepSeek V4 Pro | DeepSeek |
+| DeepSeek Coder | DeepSeek |
 | DeepSeek Chat | DeepSeek |
 | Gemini Pro | Google Gemini |
 | Local | Servidor compatible con OpenAI |
@@ -71,6 +72,7 @@ Elige uno o mas proveedores. Puedes guardar varias claves y cambiar de modelo de
 Recomendacion practica:
 
 - Usa DeepSeek si quieres una opcion economica y rapida.
+- Usa DeepSeek Coder si quieres priorizar generacion y correccion de codigo C#/Revit.
 - Usa Claude para tareas complejas y razonamiento cuidadoso.
 - Usa OpenAI si ya trabajas con su ecosistema.
 - Usa Gemini si necesitas contexto amplio.
