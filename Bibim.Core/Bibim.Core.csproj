@@ -11,7 +11,8 @@
 
   <!-- net10.0-windows only activated for R2027 config — requires .NET 10 SDK -->
   <PropertyGroup>
-    <TargetFrameworks Condition="'$(Configuration)' != 'R2027'">net48;net8.0-windows</TargetFrameworks>
+    <TargetFrameworks Condition="'$(Configuration)' == 'R2022' Or '$(Configuration)' == 'R2023' Or '$(Configuration)' == 'R2024'">net48</TargetFrameworks>
+    <TargetFrameworks Condition="'$(Configuration)' == 'R2025' Or '$(Configuration)' == 'R2026' Or '$(Configuration)' == '' Or '$(Configuration)' == 'Debug' Or '$(Configuration)' == 'Release'">net8.0-windows</TargetFrameworks>
     <TargetFrameworks Condition="'$(Configuration)' == 'R2027'">net10.0-windows</TargetFrameworks>
     <UseWPF>true</UseWPF>
     <UseWindowsForms>true</UseWindowsForms>
@@ -72,23 +73,13 @@
 
   <!-- ============================================ -->
   <!-- REVIT API REFERENCES                         -->
-  <!-- Set REVIT_SDK_PATH env var or edit paths     -->
+  <!-- Compile-time API packages avoid requiring    -->
+  <!-- every Revit version installed on build hosts. -->
   <!-- ============================================ -->
 
-  <PropertyGroup>
-    <RevitSdkPath Condition="'$(RevitSdkPath)' == ''">$(REVIT_SDK_PATH)</RevitSdkPath>
-    <RevitSdkPath Condition="'$(RevitSdkPath)' == ''">C:\Program Files\Autodesk\Revit $(RevitVersion)</RevitSdkPath>
-  </PropertyGroup>
-
   <ItemGroup>
-    <Reference Include="RevitAPI">
-      <HintPath>$(RevitSdkPath)\RevitAPI.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-    <Reference Include="RevitAPIUI">
-      <HintPath>$(RevitSdkPath)\RevitAPIUI.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
+    <PackageReference Include="Nice3point.Revit.Api.RevitAPI" Version="$(RevitVersion).*" />
+    <PackageReference Include="Nice3point.Revit.Api.RevitAPIUI" Version="$(RevitVersion).*" />
   </ItemGroup>
 
   <!-- ============================================ -->

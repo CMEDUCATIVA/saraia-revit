@@ -4,20 +4,20 @@ Esta guía documenta cómo preparar, compilar y generar el instalador de SaraIA 
 
 ## Estado Actual
 
-El instalador actual está preparado y probado para Revit 2026.
+El instalador actual está preparado para empaquetar Revit 2022 a 2027. La compilación usa paquetes NuGet de API de Revit, por lo que no requiere tener todas las versiones de Revit instaladas en la máquina de build.
 
 Compatibilidad objetivo del proyecto:
 
 | Revit | Framework | Estado local |
 |---|---|---|
-| 2022 | net48 | Requiere `RevitAPI.dll` y `RevitAPIUI.dll` de Revit 2022 |
-| 2023 | net48 | Requiere `RevitAPI.dll` y `RevitAPIUI.dll` de Revit 2023 |
-| 2024 | net48 | Requiere `RevitAPI.dll` y `RevitAPIUI.dll` de Revit 2024 |
-| 2025 | net8.0-windows | Requiere `RevitAPI.dll` y `RevitAPIUI.dll` de Revit 2025 |
-| 2026 | net8.0-windows | Disponible y compilado localmente |
-| 2027 | net10.0-windows | Requiere `RevitAPI.dll` y `RevitAPIUI.dll` de Revit 2027 |
+| 2022 | net48 | Compila con `Nice3point.Revit.Api.*` |
+| 2023 | net48 | Compila con `Nice3point.Revit.Api.*` |
+| 2024 | net48 | Compila con `Nice3point.Revit.Api.*` |
+| 2025 | net8.0-windows | Compila con `Nice3point.Revit.Api.*` |
+| 2026 | net8.0-windows | Compila con `Nice3point.Revit.Api.*` |
+| 2027 | net10.0-windows | Compila con `Nice3point.Revit.Api.*` |
 
-No se deben generar binarios de una versión usando la API de otra versión de Revit. Eso puede crear instaladores que compilan pero fallan al cargar dentro de Revit.
+No se deben generar binarios de una versión usando la API de otra versión de Revit. Cada configuración usa paquetes NuGet `Nice3point.Revit.Api.RevitAPI` y `Nice3point.Revit.Api.RevitAPIUI` con `Version="$(RevitVersion).*"`.
 
 ## Archivos Principales
 
@@ -71,7 +71,7 @@ $result = foreach($v in $versions){
 $result | Format-Table -AutoSize
 ```
 
-Solo se deben compilar las versiones donde `RevitAPI` y `RevitAPIUI` estén en `True`.
+Esta verificación sirve para saber qué versiones de Revit existen en la máquina de prueba. Para compilar, el proyecto usa paquetes NuGet de API de Revit y no depende de que todas las versiones estén instaladas localmente.
 
 ## Compilar Frontend
 
@@ -161,12 +161,7 @@ El instalador de SaraIA Revit está diseñado con este flujo:
 
 El instalador muestra las versiones de Revit 2022 a 2027.
 
-En la versión actual:
-
-- Revit 2026 aparece habilitado.
-- Revit 2022, 2023, 2024, 2025 y 2027 aparecen deshabilitados porque no hay binarios locales compilados para esas versiones.
-
-Cuando se agreguen binarios de otras versiones, se debe actualizar `SaraIAInstaller.iss` para copiar esos payloads y habilitar las opciones correspondientes.
+En la versión actual, Revit 2022, 2023, 2024, 2025, 2026 y 2027 aparecen habilitados. Las versiones detectadas en el equipo se marcan por defecto; el usuario puede seleccionar manualmente otras versiones si desea preparar la instalación antes de instalar Revit.
 
 ## Limpieza de Instalaciones Previas
 
@@ -183,7 +178,7 @@ No debe borrar automáticamente claves API o configuración personal del usuario
 
 ## Manifiesto Add-in
 
-Para Revit 2026 el instalador crea:
+Para cada versión seleccionada, el instalador crea el manifiesto correspondiente. Por ejemplo, para Revit 2026 crea:
 
 ```text
 C:\ProgramData\Autodesk\Revit\Addins\2026\SaraIA.Core.addin
@@ -268,3 +263,4 @@ Esto es intencional para evitar duplicados con instalaciones manuales previas. L
 ## Publicación
 
 El `.exe` generado en `Bibim.Core/Output/` está ignorado por Git. Para publicarlo, subirlo como artefacto de release en GitHub, no como archivo versionado dentro del repositorio.
+

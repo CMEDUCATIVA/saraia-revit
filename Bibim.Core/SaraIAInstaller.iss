@@ -48,8 +48,12 @@ FinishedHeadingLabel=SaraIA Revit se instaló correctamente
 FinishedLabel=SaraIA Revit ya está instalado.%n%nAbre Autodesk Revit y busca la pestaña SaraIA en la cinta superior. Desde Ajustes podrás configurar tus claves de OpenAI, Claude, Gemini, DeepSeek o modelos locales.
 
 [Files]
-; Current payload: Revit 2026. Future versions can be enabled by adding their compiled folders.
+Source: "bin\R2022\net48\*"; DestDir: "{app}\2022"; Flags: ignoreversion recursesubdirs skipifsourcedoesntexist
+Source: "bin\R2023\net48\*"; DestDir: "{app}\2023"; Flags: ignoreversion recursesubdirs skipifsourcedoesntexist
+Source: "bin\R2024\net48\*"; DestDir: "{app}\2024"; Flags: ignoreversion recursesubdirs skipifsourcedoesntexist
+Source: "bin\R2025\net8.0-windows\*"; DestDir: "{app}\2025"; Flags: ignoreversion recursesubdirs skipifsourcedoesntexist
 Source: "bin\R2026\net8.0-windows\*"; DestDir: "{app}\2026"; Flags: ignoreversion recursesubdirs skipifsourcedoesntexist
+Source: "bin\R2027\net10.0-windows\*"; DestDir: "{app}\2027"; Flags: ignoreversion recursesubdirs skipifsourcedoesntexist
 Source: "redist\MicrosoftEdgeWebview2Setup.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall
 Source: "Assets\Icons\SaraIA-icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "Assets\Icons\saraia-icon.svg"; DestDir: "{app}"; Flags: ignoreversion
@@ -254,21 +258,25 @@ begin
     True,
     False);
 
-  VersionPage.Add('Revit 2022 - No disponible en este instalador');
-  VersionPage.Add('Revit 2023 - No disponible en este instalador');
-  VersionPage.Add('Revit 2024 - No disponible en este instalador');
-  VersionPage.Add('Revit 2025 - No disponible en este instalador');
-  if RevitInstallExists('2026') then
-    VersionPage.Add('Revit 2026 - Detectado y disponible')
-  else
-    VersionPage.Add('Revit 2026 - Disponible, no detectado en este equipo');
-  VersionPage.Add('Revit 2027 - No disponible en este instalador');
+  if RevitInstallExists('2022') then VersionPage.Add('Revit 2022 - Detectado y disponible') else VersionPage.Add('Revit 2022 - Disponible, no detectado en este equipo');
+  if RevitInstallExists('2023') then VersionPage.Add('Revit 2023 - Detectado y disponible') else VersionPage.Add('Revit 2023 - Disponible, no detectado en este equipo');
+  if RevitInstallExists('2024') then VersionPage.Add('Revit 2024 - Detectado y disponible') else VersionPage.Add('Revit 2024 - Disponible, no detectado en este equipo');
+  if RevitInstallExists('2025') then VersionPage.Add('Revit 2025 - Detectado y disponible') else VersionPage.Add('Revit 2025 - Disponible, no detectado en este equipo');
+  if RevitInstallExists('2026') then VersionPage.Add('Revit 2026 - Detectado y disponible') else VersionPage.Add('Revit 2026 - Disponible, no detectado en este equipo');
+  if RevitInstallExists('2027') then VersionPage.Add('Revit 2027 - Detectado y disponible') else VersionPage.Add('Revit 2027 - Disponible, no detectado en este equipo');
 
   for I := 0 to 5 do
-    VersionPage.CheckListBox.ItemEnabled[I] := False;
+    VersionPage.CheckListBox.ItemEnabled[I] := True;
 
-  VersionPage.CheckListBox.ItemEnabled[4] := True;
-  VersionPage.Values[4] := True;
+  VersionPage.Values[0] := RevitInstallExists('2022');
+  VersionPage.Values[1] := RevitInstallExists('2023');
+  VersionPage.Values[2] := RevitInstallExists('2024');
+  VersionPage.Values[3] := RevitInstallExists('2025');
+  VersionPage.Values[4] := RevitInstallExists('2026');
+  VersionPage.Values[5] := RevitInstallExists('2027');
+
+  if not (VersionPage.Values[0] or VersionPage.Values[1] or VersionPage.Values[2] or VersionPage.Values[3] or VersionPage.Values[4] or VersionPage.Values[5]) then
+    VersionPage.Values[4] := True;
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
@@ -276,12 +284,25 @@ begin
   Result := True;
   if CurPageID = VersionPage.ID then
   begin
-    if not VersionPage.Values[4] then
+    if not (VersionPage.Values[0] or VersionPage.Values[1] or VersionPage.Values[2] or VersionPage.Values[3] or VersionPage.Values[4] or VersionPage.Values[5]) then
     begin
       MsgBox('Selecciona al menos una versión disponible de Revit para continuar.', mbError, MB_OK);
       Result := False;
     end;
   end;
+end;
+
+function SelectedVersions: string;
+begin
+  Result := '';
+  if VersionPage.Values[0] then Result := Result + 'Revit 2022, ';
+  if VersionPage.Values[1] then Result := Result + 'Revit 2023, ';
+  if VersionPage.Values[2] then Result := Result + 'Revit 2024, ';
+  if VersionPage.Values[3] then Result := Result + 'Revit 2025, ';
+  if VersionPage.Values[4] then Result := Result + 'Revit 2026, ';
+  if VersionPage.Values[5] then Result := Result + 'Revit 2027, ';
+  if Length(Result) > 2 then
+    Result := Copy(Result, 1, Length(Result) - 2);
 end;
 
 function UpdateReadyMemo(
@@ -306,7 +327,7 @@ begin
     'Versión: {#MyAppVersion}' + NewLine +
     'Editor: {#MyAppPublisher}' + NewLine +
     'Destino: ' + WizardDirValue + NewLine +
-    'Versiones seleccionadas: Revit 2026' + NewLine +
+    'Versiones seleccionadas: ' + SelectedVersions + NewLine +
     'Limpieza previa: ' + CleanText + NewLine +
     'Manifiesto: SaraIA.Core.addin' + NewLine + NewLine +
     'Al instalar, SaraIA copiará sus archivos, verificará WebView2 y registrará el complemento en Autodesk Revit.';
@@ -353,8 +374,13 @@ procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
   begin
-    if VersionPage.Values[4] then
-      WriteRevitAddinManifest('2026');
+    if VersionPage.Values[0] then WriteRevitAddinManifest('2022');
+    if VersionPage.Values[1] then WriteRevitAddinManifest('2023');
+    if VersionPage.Values[2] then WriteRevitAddinManifest('2024');
+    if VersionPage.Values[3] then WriteRevitAddinManifest('2025');
+    if VersionPage.Values[4] then WriteRevitAddinManifest('2026');
+    if VersionPage.Values[5] then WriteRevitAddinManifest('2027');
   end;
 end;
+
 
