@@ -223,7 +223,7 @@ namespace Bibim.Core
 </head>
 <body>
 <div class='container'>
-  <h1>Bibim v" + BibimApp.AppVersion + @"</h1>
+  <h1>SaraIA v" + BibimApp.AppVersion + @"</h1>
   <p>React frontend is not built yet.<br>Run <code>npm run build</code> in the frontend directory.</p>
   <div class='status'>Phase 1 — Boilerplate Ready</div>
 </div>

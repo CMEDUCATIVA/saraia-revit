@@ -13,7 +13,7 @@ const STRINGS = {
     noSessions: 'Sin sesiones',
     untitled: 'Sin titulo',
     messages: 'mensajes',
-    welcomeBody: 'Describe la tarea de Revit en lenguaje natural. SaraIA generara y ejecutara codigo C#.',
+    welcomeBody: 'Describe qué deseas hacer en Revit. SaraIA interpretará tu solicitud y automatizará el proceso.',
     inputPlaceholder: 'Escribe un mensaje... (@ agrega contexto de Revit)',
     stop: 'Detener',
     send: 'Enviar',
@@ -478,3 +478,4 @@ export function getContextSuggestions(): ContextSuggestion[] {
     { tag: '@phases', label: '@phases', description: t('context_phases') },
   ];
 }
+

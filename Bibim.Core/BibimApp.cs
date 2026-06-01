@@ -21,11 +21,7 @@ namespace Bibim.Core
     public class BibimApp : IExternalApplication
     {
         internal static string AppVersion { get; }
-#if APP_LANG_EN
-            = (Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? "0.0.0") + "-en";
-#else
-            = (Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? "0.0.0") + "-kr";
-#endif
+            = Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? "0.0.0";
 
         internal static string AppBuildInfo { get; }
             = Assembly.GetExecutingAssembly()
