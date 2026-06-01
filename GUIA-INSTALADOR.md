@@ -73,6 +73,12 @@ $result | Format-Table -AutoSize
 
 Esta verificación sirve para saber qué versiones de Revit existen en la máquina de prueba. Para compilar, el proyecto usa paquetes NuGet de API de Revit y no depende de que todas las versiones estén instaladas localmente.
 
+## Guía de DLLs
+
+Antes de generar el instalador, compila las DLLs por versión siguiendo [GUIA-COPILAR-DLL.md](GUIA-COPILAR-DLL.md).
+
+El instalador empaqueta las salidas de Bibim.Core/bin/R2022 a Bibim.Core/bin/R2027.
+
 ## Compilar Frontend
 
 Desde la raíz del repositorio:
@@ -263,4 +269,5 @@ Esto es intencional para evitar duplicados con instalaciones manuales previas. L
 ## Publicación
 
 El `.exe` generado en `Bibim.Core/Output/` está ignorado por Git. Para publicarlo, subirlo como artefacto de release en GitHub, no como archivo versionado dentro del repositorio.
+
 
