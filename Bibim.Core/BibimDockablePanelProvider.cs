@@ -82,6 +82,14 @@ namespace Bibim.Core
             public string TargetDocumentPath { get; set; }
             public long DocumentChangeSequence { get; set; }
             public string LibrarySnippetId { get; set; }
+
+            /// <summary>
+            /// Stages this apply produced. Each stage is its own committed
+            /// transaction, so undoing the operation means issuing this many
+            /// undos - otherwise the user would have to press Ctrl+Z once per
+            /// stage to get back to where they started.
+            /// </summary>
+            public int StageCount { get; set; } = 1;
         }
 
         /// <summary>
@@ -826,7 +834,7 @@ namespace Bibim.Core
             });
         }
 
-        private LastAppliedAction TrackAppliedAction(TaskState task)
+        private LastAppliedAction TrackAppliedAction(TaskState task, int stageCount = 1)
         {
             if (_lastAppliedAction != null &&
                 _messageActions.TryGetValue(_lastAppliedAction.ActionId, out var previousAction) &&
@@ -848,6 +856,7 @@ namespace Bibim.Core
                     task?.TargetDocumentTitle,
                     task?.TargetDocumentPath),
                 LibrarySnippetId = _pendingLibrarySnippetId,
+                StageCount = Math.Max(1, stageCount),
             };
             _pendingLibrarySnippetId = null;
 
@@ -908,18 +917,38 @@ namespace Bibim.Core
 
         private async Task<ExecutionResult> UndoLastApplyAsync(LastAppliedAction action)
         {
-            var request = new ExecutionRequest
-            {
-                Kind = ExecutionRequestKind.UndoLastApply,
-                ExpectedDocumentTitle = action?.TargetDocumentTitle,
-                ExpectedDocumentPath = action?.TargetDocumentPath,
-                Callback = new TaskCompletionSource<ExecutionResult>(
-                    TaskCreationOptions.RunContinuationsAsynchronously)
-            };
+            // A staged apply leaves one undo entry per stage. Undoing "the
+            // operation" therefore means issuing that many undos, so the user
+            // keeps a single gesture no matter how many stages it took.
+            int veces = Math.Max(1, action?.StageCount ?? 1);
+            ExecutionResult ultimo = null;
 
-            BibimApp.ExecutionHandler.Enqueue(request);
-            BibimApp.ExecutionEvent.Raise();
-            return await request.Callback.Task;
+            for (int i = 0; i < veces; i++)
+            {
+                var request = new ExecutionRequest
+                {
+                    Kind = ExecutionRequestKind.UndoLastApply,
+                    ExpectedDocumentTitle = action?.TargetDocumentTitle,
+                    ExpectedDocumentPath = action?.TargetDocumentPath,
+                    Callback = new TaskCompletionSource<ExecutionResult>(
+                        TaskCreationOptions.RunContinuationsAsynchronously)
+                };
+
+                BibimApp.ExecutionHandler.Enqueue(request);
+                BibimApp.ExecutionEvent.Raise();
+                ultimo = await request.Callback.Task;
+
+                if (!ultimo.Success)
+                {
+                    if (i > 0)
+                        ultimo.ErrorMessage =
+                            $"Undid {i} of {veces} stage(s): {ultimo.ErrorMessage}";
+                    return ultimo;
+                }
+            }
+
+            if (ultimo != null) ultimo.StagesApplied = veces;
+            return ultimo;
         }
 
         private string BuildTaskPlannerPrompt()
@@ -1495,12 +1524,91 @@ Constraints:
             if (compilationResult?.Assembly == null)
                 throw new InvalidOperationException("No compiled assembly is available.");
 
+            var etapas = StagePlan.Parse(
+                compilationResult.OriginalSource ?? compilationResult.NormalizedSource);
+
+            // Dry run: every stage runs inside one execution and the whole lot is
+            // rolled back. Splitting it would defeat the point - stage 2 needs the
+            // geometry stage 1 created, and none of it is ever visible anyway.
+            if (isDryRun || etapas.Count <= 1)
+            {
+                var unica = await RunOneExecutionAsync(
+                    compilationResult, isDryRun, task, -1, etapas.Count, etapas);
+                unica.StagesApplied = isDryRun ? etapas.Count : 1;
+                return unica;
+            }
+
+            // Visible apply: ONE execution per stage. Between executions Revit gets
+            // its message loop back, repaints, and the user watches the model being
+            // built instead of staring at a frozen window.
+            ExecutionResult ultimo = null;
+            var registro = new List<string>();
+            int aplicadas = 0;
+
+            for (int i = 0; i < etapas.Count; i++)
+            {
+                string nombre = StagePlan.NameAt(etapas, i);
+                _bridge?.PostMessage("progress", new[] {
+                    new { label = $"{nombre} ({i + 1}/{etapas.Count})", status = "active" }
+                });
+
+                ultimo = await RunOneExecutionAsync(
+                    compilationResult, false, task, i, etapas.Count, etapas);
+
+                if (!ultimo.Success)
+                {
+                    // Stop on the first failure. The stages already applied stay in
+                    // the model, so the message has to say how far it got.
+                    ultimo.StagesApplied = aplicadas;
+                    ultimo.ErrorMessage = UiText(
+                        $"[{nombre} - stage {i + 1}/{etapas.Count}] {ultimo.ErrorMessage} " +
+                        $"({aplicadas} stage(s) were applied before the failure.)",
+                        null);
+                    _bridge?.PostMessage("progress", new object[0]);
+                    return ultimo;
+                }
+
+                aplicadas++;
+                if (!string.IsNullOrWhiteSpace(ultimo.Output))
+                    registro.Add($"{nombre}: {ultimo.Output}");
+
+                // Hand the UI thread back so Revit repaints this stage before the
+                // next one starts. Without it the stages run back to back and the
+                // user sees a single jump, which is what we were fixing.
+                await Task.Delay(StageSettleMs);
+            }
+
+            _bridge?.PostMessage("progress", new object[0]);
+
+            if (ultimo != null)
+            {
+                ultimo.StagesApplied = aplicadas;
+                if (registro.Count > 0)
+                    ultimo.Output = string.Join("\n", registro);
+            }
+            return ultimo;
+        }
+
+        /// <summary>Pause between staged commits so Revit repaints each stage.</summary>
+        private const int StageSettleMs = 450;
+
+        private async Task<ExecutionResult> RunOneExecutionAsync(
+            CompilationResult compilationResult,
+            bool isDryRun,
+            TaskState task,
+            int stageIndex,
+            int stageCount,
+            List<string> stageNames)
+        {
             var request = new ExecutionRequest
             {
                 CompiledAssembly = compilationResult.Assembly,
                 EntryTypeName = "BibimGenerated.Program",
                 EntryMethodName = "Execute",
                 IsDryRun = isDryRun,
+                StageIndex = stageIndex,
+                StageCount = Math.Max(1, stageCount),
+                StageNames = stageNames,
                 ExpectedDocumentTitle = task?.TargetDocumentTitle,
                 ExpectedDocumentPath = task?.TargetDocumentPath,
                 Callback = new TaskCompletionSource<ExecutionResult>(
@@ -1907,7 +2015,7 @@ Constraints:
                 if (!isDryRun || !execResult.Success)
                 {
                     var action = (!isDryRun && execResult.Success)
-                        ? TrackAppliedAction(task)
+                        ? TrackAppliedAction(task, execResult.StagesApplied)
                         : null;
 
                     // Append ctx.Log() entries to output when present
