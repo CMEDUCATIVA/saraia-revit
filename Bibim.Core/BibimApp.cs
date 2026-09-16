@@ -316,6 +316,45 @@ namespace Bibim.Core
             showPanelBtn.ToolTip = "Open SaraIA Assistant";
             panel.AddItem(showPanelBtn);
 
+            // Second button: the local Control API's address, token and endpoint
+            // reference, copyable in one click. The port and token are per-machine,
+            // so printed documentation is useless without them - this is what makes
+            // the API usable from a desktop AI assistant.
+            try
+            {
+                var apiBtn = new PushButtonData(
+                    "BibimShowApi",
+                    "Endpoints",
+                    assemblyPath,
+                    typeof(BibimShowApiCommand).FullName);
+
+                try
+                {
+                    string iconDir = Path.Combine(
+                        Path.GetDirectoryName(assemblyPath) ?? "", "Assets", "Icons");
+                    string icon32 = Path.Combine(iconDir, "SaraIA-icon-32.png");
+                    string icon16 = Path.Combine(iconDir, "SaraIA-icon-16.png");
+                    if (File.Exists(icon32)) apiBtn.LargeImage = new BitmapImage(new Uri(icon32));
+                    if (File.Exists(icon16)) apiBtn.Image = new BitmapImage(new Uri(icon16));
+                }
+                catch (Exception iconEx)
+                {
+                    Logger.Log("BibimApp", $"API button icon skipped: {iconEx.Message}");
+                }
+
+                apiBtn.ToolTip = "Direccion, token y endpoints de la Control API local";
+                apiBtn.LongDescription =
+                    "Muestra la URL y el token de esta instalacion junto a los cinco endpoints " +
+                    "(/status, /context, /execute, /view/image, /undo) y los copia al portapapeles " +
+                    "listos para pegar en un asistente de IA de escritorio.";
+                panel.AddItem(apiBtn);
+            }
+            catch (Exception apiBtnEx)
+            {
+                // Non-critical: the chat button must survive even if this one fails.
+                Logger.Log("BibimApp", $"API button skipped: {apiBtnEx.Message}");
+            }
+
             Logger.Log("BibimApp", "Ribbon UI created");
         }
 
