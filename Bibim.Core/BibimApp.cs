@@ -14,9 +14,9 @@ using System.Runtime.Loader;
 namespace Bibim.Core
 {
     /// <summary>
-    /// SaraIA — Revit Native C# Add-in entry point.
+    /// SaraIA ï¿½ Revit Native C# Add-in entry point.
     /// Implements IExternalApplication for full Revit lifecycle access.
-    /// Version is read from assembly (set in csproj) — single source of truth.
+    /// Version is read from assembly (set in csproj) ï¿½ single source of truth.
     /// </summary>
     public class BibimApp : IExternalApplication
     {
@@ -53,6 +53,12 @@ namespace Bibim.Core
         internal static ExternalEvent ExecutionEvent { get; private set; }
         internal static BibimExecutionHandler ExecutionHandler { get; private set; }
 
+        // Generic main-thread invoker + local HTTP control API (external orchestration,
+        // e.g. a Kun skill driving Revit). Loopback-only; opt-out via control_api.json.
+        internal static ExternalEvent ControlApiEvent { get; private set; }
+        internal static RevitApiDispatcher ControlApiDispatcher { get; private set; }
+        private static ControlApiServer _controlApiServer;
+
 #if NET8_0_OR_GREATER
         private static AssemblyDependencyResolver _dependencyResolver;
         private static AssemblyLoadContext _loadContext;
@@ -73,7 +79,7 @@ namespace Bibim.Core
             {
                 Logger.Log("BibimApp", $"SaraIA v{AppVersion} OnStartup begin (build={AppBuildInfo})");
 
-                // 1. Ribbon UI FIRST — this must succeed for the tab to appear
+                // 1. Ribbon UI FIRST ï¿½ this must succeed for the tab to appear
                 CreateRibbonUI(application);
                 Logger.Log("BibimApp", "Ribbon UI created");
 
@@ -82,7 +88,14 @@ namespace Bibim.Core
                 ExecutionEvent = ExternalEvent.Create(ExecutionHandler);
                 Logger.Log("BibimApp", "ExternalEvent created");
 
-                // 3. Infrastructure init — wrapped separately so ribbon survives
+                // 2b. Generic main-thread dispatcher for the control API (read/image work).
+                // ExternalEvent.Create must run in a valid context â€” OnStartup qualifies.
+                ControlApiDispatcher = new RevitApiDispatcher();
+                ControlApiEvent = ExternalEvent.Create(ControlApiDispatcher);
+                ControlApiDispatcher.SetEvent(ControlApiEvent);
+                Logger.Log("BibimApp", "Control API dispatcher created");
+
+                // 3. Infrastructure init ï¿½ wrapped separately so ribbon survives
                 try
                 {
                     AppLanguage.Initialize();
@@ -101,12 +114,24 @@ namespace Bibim.Core
                     Logger.Log("BibimApp", $"Service init partial fail (non-fatal): {svcEx.Message}");
                 }
 
+                // 3b. Local HTTP control API â€” lets an external orchestrator (Kun skill)
+                // drive Revit. Loopback-only; opt-out via %AppData%\Bibim\control_api.json.
+                try
+                {
+                    _controlApiServer = new ControlApiServer(ControlApiDispatcher);
+                    _controlApiServer.Start();
+                }
+                catch (Exception apiEx)
+                {
+                    Logger.Log("BibimApp", $"Control API start failed (non-fatal): {apiEx.Message}");
+                }
+
                 // 4. Hook into Revit Idling to capture UIApplication for RevitContextProvider
                 // UIControlledApplication doesn't expose UIApplication directly,
                 // so we grab it on the first Idling event.
                 application.Idling += OnFirstIdling;
 
-                // 4. Dockable pane — register after ribbon
+                // 4. Dockable pane ï¿½ register after ribbon
                 try
                 {
                     var panelId = new DockablePaneId(DockablePaneGuid);
@@ -139,7 +164,7 @@ namespace Bibim.Core
         {
             try
             {
-                // Unsubscribe immediately — we only need this once
+                // Unsubscribe immediately ï¿½ we only need this once
                 UiCtrlApp.Idling -= OnFirstIdling;
 
                 var uiApp = sender as UIApplication;
@@ -215,6 +240,9 @@ namespace Bibim.Core
                 Logger.Log("BibimApp", $"OnShutdown cleanup warning: {ex.Message}");
             }
 
+            try { _controlApiServer?.Stop(); }
+            catch (Exception ex) { Logger.Log("BibimApp", $"Control API stop warning: {ex.Message}"); }
+
             ServiceContainer.Reset();
             WindowsNotificationService.Dispose();
             return Result.Succeeded;
@@ -263,7 +291,7 @@ namespace Bibim.Core
                 assemblyPath,
                 typeof(BibimShowPanelCommand).FullName);
 
-            // Icon setup — non-critical
+            // Icon setup ï¿½ non-critical
             try
             {
                 string iconDir = Path.Combine(
@@ -287,6 +315,45 @@ namespace Bibim.Core
 
             showPanelBtn.ToolTip = "Open SaraIA Assistant";
             panel.AddItem(showPanelBtn);
+
+            // Second button: the local Control API's address, token and endpoint
+            // reference, copyable in one click. The port and token are per-machine,
+            // so printed documentation is useless without them - this is what makes
+            // the API usable from a desktop AI assistant.
+            try
+            {
+                var apiBtn = new PushButtonData(
+                    "BibimShowApi",
+                    "Endpoints",
+                    assemblyPath,
+                    typeof(BibimShowApiCommand).FullName);
+
+                try
+                {
+                    string iconDir = Path.Combine(
+                        Path.GetDirectoryName(assemblyPath) ?? "", "Assets", "Icons");
+                    string icon32 = Path.Combine(iconDir, "SaraIA-icon-32.png");
+                    string icon16 = Path.Combine(iconDir, "SaraIA-icon-16.png");
+                    if (File.Exists(icon32)) apiBtn.LargeImage = new BitmapImage(new Uri(icon32));
+                    if (File.Exists(icon16)) apiBtn.Image = new BitmapImage(new Uri(icon16));
+                }
+                catch (Exception iconEx)
+                {
+                    Logger.Log("BibimApp", $"API button icon skipped: {iconEx.Message}");
+                }
+
+                apiBtn.ToolTip = "Direccion, token y endpoints de la Control API local";
+                apiBtn.LongDescription =
+                    "Muestra la URL y el token de esta instalacion junto a los cinco endpoints " +
+                    "(/status, /context, /execute, /view/image, /undo) y los copia al portapapeles " +
+                    "listos para pegar en un asistente de IA de escritorio.";
+                panel.AddItem(apiBtn);
+            }
+            catch (Exception apiBtnEx)
+            {
+                // Non-critical: the chat button must survive even if this one fails.
+                Logger.Log("BibimApp", $"API button skipped: {apiBtnEx.Message}");
+            }
 
             Logger.Log("BibimApp", "Ribbon UI created");
         }

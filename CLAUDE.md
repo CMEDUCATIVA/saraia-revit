@@ -85,6 +85,30 @@ Three latent multi-provider bugs that broke the task → question → codegen fl
 ## Loading-State Safety
 - `LlmOrchestrationService.SendMessageAsync` and `GenerateWithToolsAsync` both wrap the body in try/catch with `finally { OnStatusUpdate?.Invoke(null); }`. **Do not remove the finally block** — without it, an LLM error (429, network, etc.) leaves the chat panel stuck on "Generating response...".
 
+## Staged Builds (v1.1+)
+Revit's UI thread runs everything `/execute` and the panel execute; **Revit cannot repaint
+while generated code runs**. A long single execution looks like a hang (Windows marks the
+window "Not Responding") and shows the user nothing. Fix is structural, not cosmetic:
+
+- `Services/StagePlan.cs` — parses the `// ETAPAS: a | b | c` directive out of generated
+  code. No directive → single stage, old behaviour preserved.
+- Generated code branches on `ctx.Stage` (`BibimExecutionContext.Stage` / `StageCount` /
+  `StageName`). Compiled ONCE, `Execute` invoked once per stage — locals do NOT survive
+  between stages; re-query the model instead.
+- `ExecutionRequest.StageIndex`: `-1` runs the whole plan in one execution (dry run, where
+  stages must accumulate before the group rolls back); `>= 0` runs that one stage.
+- `BibimDockablePanelProvider.ExecuteCompilationAsync` is the single choke point: on a
+  **commit** with >1 stage it loops, one execution per stage, posting progress and waiting
+  `StageSettleMs` between them so Revit repaints.
+- Each stage is its own committed transaction → one undo entry per stage.
+  `UndoLastApplyAsync` repeats `LastAppliedAction.StageCount` times so the user keeps a
+  single gesture. Control API exposes the same via `POST /undo {count}`.
+- **Never `Thread.Sleep` inside generated code or a handler** — it blocks the main thread
+  and is what freezes Revit. The pause belongs in the caller, between executions.
+- Guardrail: `BibimExecutionHandler.MainThreadWarnMs` (2500 ms) → warning in
+  `ExecutionResult.RevitWarnings` + `[MAIN_THREAD_WARNING]` log line.
+- Prompt contract lives in `CodeGenSystemPrompt.BuildBasePrompt` (STAGED BUILD block).
+
 ## Commit Workflow
 1. Scan changes: `git status --porcelain`
 2. Stage files explicitly — never `git add -A` or `git add .`

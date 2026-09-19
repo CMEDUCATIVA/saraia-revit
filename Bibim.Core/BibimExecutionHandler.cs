@@ -38,6 +38,12 @@ namespace Bibim.Core
         public static bool IsDryRun { get; internal set; }
 
         /// <summary>
+        /// Above this, an execution has blocked Revit's UI long enough for Windows
+        /// to consider the window unresponsive. Reported back as a warning.
+        /// </summary>
+        private const long MainThreadWarnMs = 2500;
+
+        /// <summary>
         /// Enqueue an execution request from a background thread.
         /// Call BibimApp.ExecutionEvent.Raise() after enqueuing.
         /// </summary>
@@ -55,6 +61,7 @@ namespace Bibim.Core
             {
                 var result = new ExecutionResult();
                 result.MemoryBefore = GC.GetTotalMemory(false);
+                var cronoHilo = System.Diagnostics.Stopwatch.StartNew();
 
                 try
                 {
@@ -101,6 +108,21 @@ namespace Bibim.Core
                     // COM Object Leak defense (design doc §2.3)
                     PerformComCleanup();
                     result.MemoryAfter = GC.GetTotalMemory(false);
+
+                    // Main-thread guardrail. Everything here runs on Revit's UI thread,
+                    // so a long execution freezes the window and Windows paints it as
+                    // "Not Responding" - the user sees a hang, not progress. We cannot
+                    // preempt it, but we can tell the caller to cut its stages smaller.
+                    cronoHilo.Stop();
+                    result.MainThreadMs = cronoHilo.ElapsedMilliseconds;
+                    if (result.MainThreadMs > MainThreadWarnMs)
+                    {
+                        string aviso = $"Execution held Revit's main thread for {result.MainThreadMs} ms. " +
+                            "Revit cannot repaint while this runs; split the work into smaller stages.";
+                        Logger.Log("BibimExecutionHandler", $"[MAIN_THREAD_WARNING] {aviso}");
+                        result.RevitWarnings = result.RevitWarnings ?? new List<string>();
+                        result.RevitWarnings.Add(aviso);
+                    }
 
                     long delta = result.MemoryAfter - result.MemoryBefore;
                     if (delta > 50 * 1024 * 1024) // >50MB growth warning
@@ -181,8 +203,13 @@ namespace Bibim.Core
                     txGroup.Start();
                     try
                     {
+                        // A dry run runs EVERY stage inside this one group: the stages
+                        // must accumulate (stage 2 builds on stage 1) before the
+                        // rollback below discards the lot. Nothing is visible either
+                        // way, so there is nothing to gain by splitting it up.
                         var ctx = new BibimExecutionContext();
-                        var output = InvokeGeneratedCode(request, app, ctx);
+                        object output = RunStages(request, app, ctx, out int etapas);
+                        result.StagesApplied = etapas;
 
                         result.AffectedElementCount = _modifiedElementIds.Count;
                         result.Success = true;
@@ -202,6 +229,13 @@ namespace Bibim.Core
                         result.Exception = inner;
                         result.ErrorMessage = $"[DryRun Error] {inner.Message}";
                     }
+
+                    // Capture the SIMULATED state while the group is still open.
+                    // This is the whole point of the dry-run capture: the caller
+                    // sees what the code would produce, then the RollBack below
+                    // leaves the document exactly as it was. Runs even when the
+                    // code threw - a partial result is often what explains the failure.
+                    CaptureIfRequested(doc, request, result);
 
                     // RollBack the group — undoes all committed transactions,
                     // restoring the document to its original state
@@ -242,11 +276,15 @@ namespace Bibim.Core
                 try
                 {
                     var ctx = new BibimExecutionContext();
-                    var output = InvokeGeneratedCode(request, app, ctx);
+                    object output = RunStages(request, app, ctx, out int etapas);
+                    result.StagesApplied = etapas;
                     result.Success = true;
                     result.AffectedElementCount = _modifiedElementIds.Count;
                     result.Output = output?.ToString() ?? "Execution completed.";
                     txGroup.Assimilate();
+
+                    // Post-commit capture: the model is now in its final state.
+                    CaptureIfRequested(doc, request, result);
 
                     var logs = ctx.GetLogs();
                     if (logs.Count > 0)
@@ -279,6 +317,65 @@ namespace Bibim.Core
 
             if (_collectedWarnings.Count > 0)
                 result.RevitWarnings = new List<string>(_collectedWarnings);
+        }
+
+        /// <summary>
+        /// Invokes the compiled entry point once per stage.
+        ///
+        /// StageIndex &gt;= 0 runs exactly that stage - the visible-apply path, where
+        /// the caller issues one execution per stage so Revit gets its message loop
+        /// back between them and actually repaints. StageIndex &lt; 0 runs the whole
+        /// plan in this single call, which is what a dry run needs.
+        ///
+        /// Returns the output of the last stage that produced one.
+        /// </summary>
+        private object RunStages(ExecutionRequest request, UIApplication app,
+                                 BibimExecutionContext ctx, out int stagesRun)
+        {
+            int total = Math.Max(1, request.StageCount);
+            ctx.StageCount = total;
+
+            if (request.StageIndex >= 0)
+            {
+                int i = Math.Min(request.StageIndex, total - 1);
+                ctx.Stage = i;
+                ctx.StageName = StagePlan.NameAt(request.StageNames, i);
+                stagesRun = 1;
+                return InvokeGeneratedCode(request, app, ctx);
+            }
+
+            object last = null;
+            for (int i = 0; i < total; i++)
+            {
+                ctx.Stage = i;
+                ctx.StageName = StagePlan.NameAt(request.StageNames, i);
+                var salida = InvokeGeneratedCode(request, app, ctx);
+                if (salida != null) last = salida;
+            }
+            stagesRun = total;
+            return last;
+        }
+
+        /// <summary>
+        /// Export the active view when the request asked for it. Never throws and
+        /// never fails the execution - a missing image is reported through
+        /// ExecutionResult.CaptureError while the execution result stands on its own.
+        /// </summary>
+        private static void CaptureIfRequested(Document doc, ExecutionRequest request, ExecutionResult result)
+        {
+            if (request == null || !request.CaptureImage) return;
+            try
+            {
+                string error;
+                result.ViewImageBase64 = ViewImageExporter.TryExportActiveView(
+                    doc, request.CaptureWidth, out error);
+                result.CaptureError = error;
+            }
+            catch (Exception ex)
+            {
+                result.CaptureError = ex.Message;
+                Logger.Log("BibimExecutionHandler", $"[Capture] Failed: {ex.Message}");
+            }
         }
 
         /// <summary>

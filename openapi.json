@@ -1,0 +1,351 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "SaraIA Control API",
+    "version": "1.1.0",
+    "summary": "API HTTP local del complemento SaraIA para Autodesk Revit.",
+    "description": "Permite que un orquestador externo lea el modelo, ejecute codigo C# dentro de Revit y capture la vista activa, sin pasar por el chat del panel.\n\nEl plugin son las manos y los ojos dentro de Revit; la planificacion vive fuera.\n\n**Solo loopback.** El servidor escucha unicamente en 127.0.0.1 y no es accesible desde la red. El puerto y el token estan en `%AppData%\\Bibim\\control_api.json` y son distintos en cada equipo.\n\n**Dos limites que conviene conocer:**\n\n1. Revit no repinta mientras corre el codigo: todo se ejecuta en su hilo principal. Una ejecucion larga se ve congelada y Windows acaba marcandola como \"No responde\". Parte el trabajo en varias llamadas cortas y pon las esperas entre ellas, nunca dentro del codigo. Si una ejecucion supera 2,5 s, la respuesta lo avisa en `warnings` y lo reporta en `mainThreadMs`.\n\n2. El dry-run se revierte antes de que Revit dibuje nada. Para ver el resultado simulado hay que pedir `capture`.",
+    "license": { "name": "Apache-2.0", "identifier": "Apache-2.0" }
+  },
+  "servers": [
+    { "url": "http://127.0.0.1:8757", "description": "Instancia local de Revit (puerto por defecto)" }
+  ],
+  "security": [{ "bearerAuth": [] }],
+  "tags": [
+    { "name": "Lectura", "description": "No modifican el modelo" },
+    { "name": "Escritura", "description": "Pueden modificar el documento abierto" }
+  ],
+  "paths": {
+    "/status": {
+      "get": {
+        "tags": ["Lectura"],
+        "summary": "Estado del complemento y del documento activo",
+        "description": "Comprueba que Revit responde y devuelve el documento y la vista activos. Conviene llamarlo primero: si no hay documento abierto, el resto de endpoints fallara.",
+        "operationId": "getStatus",
+        "responses": {
+          "200": {
+            "description": "Estado actual",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/StatusResponse" },
+                "example": {
+                  "ok": true,
+                  "version": "1.1.0",
+                  "revitVersion": "2026",
+                  "document": {
+                    "hasDocument": true,
+                    "documentTitle": "Proyecto1",
+                    "documentPath": "",
+                    "activeView": "Edificio - 3D",
+                    "activeViewType": "ThreeD"
+                  }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/NoAutorizado" }
+        }
+      }
+    },
+    "/context": {
+      "get": {
+        "tags": ["Lectura"],
+        "summary": "Contexto vivo del modelo, como texto",
+        "description": "Devuelve informacion real del modelo ya formateada para meterla en un prompt. Sirve para que el codigo que se genere se apoye en datos reales y no en supuestos.\n\nUna etiqueta desconocida devuelve `ok: true` con el texto `[Context Error] ...`, asi que conviene comprobar el contenido y no solo el campo `ok`.",
+        "operationId": "getContext",
+        "parameters": [
+          {
+            "name": "tag",
+            "in": "query",
+            "required": true,
+            "description": "Etiqueta de contexto. Las de categoria admiten sufijo, por ejemplo `@family:Doors` o `@parameters:Walls`.",
+            "schema": {
+              "type": "string",
+              "examples": ["@view", "@selection", "@levels", "@worksets", "@phases", "@family:Doors", "@parameters:Walls"]
+            }
+          },
+          { "$ref": "#/components/parameters/TokenQuery" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Texto del contexto",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ContextResponse" },
+                "example": {
+                  "ok": true,
+                  "tag": "@levels",
+                  "text": "[Project Levels] 6 level(s)\n  - Nivel 1 (Elevation: 0,00, Id: 355)"
+                }
+              }
+            }
+          },
+          "400": { "description": "Falta el parametro tag" },
+          "401": { "$ref": "#/components/responses/NoAutorizado" }
+        }
+      }
+    },
+    "/view/image": {
+      "get": {
+        "tags": ["Lectura"],
+        "summary": "PNG de la vista activa, en base64",
+        "description": "Exporta la vista activa a PNG para que un modelo con vision compruebe si lo construido se parece a lo pedido.\n\nEl encuadre lo decide Revit ajustando la geometria visible, asi que la imagen **no** refleja el zoom que ve el usuario en pantalla.",
+        "operationId": "getViewImage",
+        "parameters": [
+          {
+            "name": "width",
+            "in": "query",
+            "required": false,
+            "description": "Ancho en pixeles.",
+            "schema": { "type": "integer", "default": 1600, "minimum": 1, "maximum": 4096 }
+          },
+          { "$ref": "#/components/parameters/TokenQuery" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Imagen, o motivo por el que no pudo exportarse",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ViewImageResponse" },
+                "example": { "ok": true, "format": "png", "width": 1600, "base64": "iVBORw0KGgo..." }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/NoAutorizado" }
+        }
+      }
+    },
+    "/execute": {
+      "post": {
+        "tags": ["Escritura"],
+        "summary": "Compila y ejecuta codigo C# dentro de Revit",
+        "description": "Es el endpoint principal: buscar, crear, modificar y borrar se hacen aqui con codigo, no con rutas propias.\n\n**Contrato del codigo.** Puedes enviar solo el cuerpo (se envuelve automaticamente) o una clase completa con `public static object Execute(UIApplication uiApp, Bibim.Core.BibimExecutionContext ctx)`. Ya existen en ambito `app`, `doc`, `uidoc` y `ctx`; no los redeclares. Usa `ctx.Log(\"...\")` para trazas, que vuelven en `logs`.\n\n**Las transacciones las abres tu:** `using (var tx = new Transaction(doc, \"...\")) { tx.Start(); ... tx.Commit(); }`.\n\n**Semantica de los modos.** `dryrun` envuelve la ejecucion en un TransactionGroup y lo revierte siempre: el documento queda intacto. `commit` la asimila, de modo que toda la operacion es **una sola entrada de deshacer**. Si el codigo lanza una excepcion en `commit`, se revierte entero.\n\n**Etapas.** Para que el usuario vea el modelo construirse, envia el mismo codigo en varias llamadas con `stageIndex` 0,1,2... El codigo se ramifica con `ctx.Stage`. Entre llamada y llamada Revit recupera el control y repinta. Nada sobrevive entre etapas: lo que una etapa posterior necesite se vuelve a consultar al modelo.",
+        "operationId": "postExecute",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ExecuteRequest" },
+              "examples": {
+                "lectura": {
+                  "summary": "Consulta sencilla",
+                  "value": {
+                    "code": "return new FilteredElementCollector(doc).OfClass(typeof(Wall)).WhereElementIsNotElementType().GetElementCount();",
+                    "mode": "dryrun"
+                  }
+                },
+                "simulacionConImagen": {
+                  "summary": "Simular y ver el resultado sin tocar el modelo",
+                  "value": {
+                    "code": "using (var tx = new Transaction(doc, \"Muro\")) { tx.Start(); /* ... */ tx.Commit(); } return \"ok\";",
+                    "mode": "dryrun",
+                    "capture": true,
+                    "captureWidth": 1600
+                  }
+                },
+                "etapa": {
+                  "summary": "Una etapa de un montaje visible",
+                  "value": {
+                    "code": "switch (ctx.Stage) { case 0: /* cimentacion */ break; case 1: /* muros */ break; }",
+                    "mode": "commit",
+                    "stageIndex": 1,
+                    "stageCount": 4,
+                    "stageLabel": "Muros"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Resultado de la ejecucion. Un fallo de compilacion tambien devuelve 200, con `compiled: false`.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ExecuteResponse" },
+                "examples": {
+                  "correcto": {
+                    "summary": "Ejecucion correcta",
+                    "value": {
+                      "success": true, "compiled": true, "mode": "dryrun",
+                      "output": "Muros: 30", "error": null,
+                      "affectedElementCount": 0, "logs": ["sonda"], "warnings": null,
+                      "documentTitle": "Proyecto1", "stagesApplied": 1, "mainThreadMs": 412
+                    }
+                  },
+                  "errorDeCompilacion": {
+                    "summary": "No compila: el detalle de Roslyn viene en error",
+                    "value": {
+                      "success": false, "compiled": false, "mode": "dryrun",
+                      "output": null,
+                      "error": "[CS1061] Line 19: \"Document\" no contiene una definicion para \"EstoNoExiste\"",
+                      "affectedElementCount": 0
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "description": "El cuerpo no es JSON valido o falta `code`" },
+          "401": { "$ref": "#/components/responses/NoAutorizado" },
+          "503": { "description": "El manejador de ejecucion aun no esta listo" },
+          "504": { "description": "Tiempo agotado esperando al hilo principal de Revit (180 s). Puede haber un dialogo modal abierto. Aviso: el trabajo sigue en cola y puede aplicarse igualmente." }
+        }
+      }
+    },
+    "/undo": {
+      "post": {
+        "tags": ["Escritura"],
+        "summary": "Deshace N pasos en el documento",
+        "description": "Un montaje por etapas deja **una entrada de deshacer por etapa**, asi que para revertir la operacion completa se pasa el numero de etapas aplicadas (`stagesApplied`).\n\nSi un paso falla, `undone` indica cuantos se llegaron a deshacer.",
+        "operationId": "postUndo",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/UndoRequest" },
+              "example": { "count": 9 }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Resultado del deshacer",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/UndoResponse" },
+                "example": { "ok": true, "requested": 9, "undone": 9, "error": null }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/NoAutorizado" },
+          "503": { "description": "El manejador de ejecucion aun no esta listo" }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Token generado en el primer arranque y guardado en `%AppData%\\Bibim\\control_api.json`. Permite ejecutar codigo arbitrario dentro de Revit: tratalo como una contrasena.\n\nEn peticiones GET se admite tambien `?token=<token>` en la query, util para abrir una imagen en el navegador."
+      }
+    },
+    "parameters": {
+      "TokenQuery": {
+        "name": "token",
+        "in": "query",
+        "required": false,
+        "description": "Alternativa a la cabecera Authorization, solo para GET.",
+        "schema": { "type": "string" }
+      }
+    },
+    "responses": {
+      "NoAutorizado": {
+        "description": "Falta el token o no coincide",
+        "content": {
+          "application/json": {
+            "example": { "ok": false, "error": "Unauthorized. Provide Authorization: Bearer <token>." }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "StatusResponse": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "version": { "type": "string", "description": "Version de SaraIA" },
+          "revitVersion": { "type": "string", "description": "Version de Revit, por ejemplo 2026" },
+          "document": {
+            "type": "object",
+            "properties": {
+              "hasDocument": { "type": "boolean" },
+              "documentTitle": { "type": ["string", "null"] },
+              "documentPath": { "type": ["string", "null"], "description": "Vacio si el proyecto no se ha guardado nunca" },
+              "activeView": { "type": ["string", "null"] },
+              "activeViewType": { "type": ["string", "null"] }
+            }
+          }
+        }
+      },
+      "ContextResponse": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "tag": { "type": "string" },
+          "text": { "type": "string", "description": "Contexto ya formateado. Si la etiqueta no existe, empieza por `[Context Error]`." }
+        }
+      },
+      "ViewImageResponse": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "format": { "type": "string", "const": "png" },
+          "width": { "type": "integer" },
+          "base64": { "type": "string", "description": "PNG codificado en base64" },
+          "error": { "type": ["string", "null"], "description": "Presente cuando ok es false" }
+        }
+      },
+      "ExecuteRequest": {
+        "type": "object",
+        "required": ["code"],
+        "properties": {
+          "code": { "type": "string", "description": "C# a ejecutar. Ver la descripcion del endpoint para el contrato." },
+          "mode": {
+            "type": "string", "enum": ["dryrun", "commit"], "default": "dryrun",
+            "description": "`dryrun` se revierte siempre; `commit` se aplica como una unica entrada de deshacer."
+          },
+          "capture": {
+            "type": "boolean", "default": false,
+            "description": "Devuelve un PNG de la vista en `imageBase64`. En dry-run la imagen se toma con el TransactionGroup aun abierto, asi que muestra el resultado SIMULADO."
+          },
+          "captureWidth": { "type": "integer", "default": 1600, "minimum": 1, "maximum": 4096 },
+          "stageIndex": {
+            "type": "integer", "default": -1,
+            "description": "Etapa a ejecutar. `-1` ejecuta el plan entero en esta llamada (lo normal en dry-run). `0,1,2...` en llamadas separadas para un montaje visible."
+          },
+          "stageCount": { "type": "integer", "default": 1, "minimum": 1, "description": "Total de etapas del plan." },
+          "stageLabel": { "type": "string", "description": "Nombre de la etapa, para trazas." }
+        }
+      },
+      "ExecuteResponse": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean", "description": "La ejecucion termino sin excepcion" },
+          "compiled": { "type": "boolean", "description": "false si fallo la compilacion; el detalle esta en `error`" },
+          "mode": { "type": "string", "enum": ["dryrun", "commit"] },
+          "output": { "type": ["string", "null"], "description": "Lo que devuelve el codigo con `return`" },
+          "error": { "type": ["string", "null"], "description": "Diagnostico de Roslyn o mensaje de la excepcion" },
+          "affectedElementCount": { "type": "integer", "description": "Elementos modificados, medidos con el evento DocumentChanged de Revit" },
+          "logs": { "type": ["array", "null"], "items": { "type": "string" }, "description": "Entradas de `ctx.Log(...)`" },
+          "warnings": { "type": ["array", "null"], "items": { "type": "string" }, "description": "Avisos de Revit durante la ejecucion, mas el aviso de hilo principal si procede" },
+          "documentTitle": { "type": ["string", "null"] },
+          "imageBase64": { "type": ["string", "null"], "description": "Solo si se pidio `capture`" },
+          "captureError": { "type": ["string", "null"], "description": "Por que fallo la captura. Una captura fallida NO hace fallar la ejecucion." },
+          "stagesApplied": { "type": "integer", "description": "Etapas aplicadas por esta llamada. Pasalo a /undo para revertir la operacion entera." },
+          "mainThreadMs": { "type": "integer", "format": "int64", "description": "Milisegundos que esta ejecucion retuvo el hilo principal de Revit. Por encima de 2500 se emite un aviso." }
+        }
+      },
+      "UndoRequest": {
+        "type": "object",
+        "properties": {
+          "count": {
+            "type": "integer", "default": 1, "minimum": 1, "maximum": 100,
+            "description": "Pasos a deshacer. Valores menores que 1 se elevan a 1."
+          }
+        }
+      },
+      "UndoResponse": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "requested": { "type": "integer" },
+          "undone": { "type": "integer" },
+          "error": { "type": ["string", "null"] }
+        }
+      }
+    }
+  }
+}

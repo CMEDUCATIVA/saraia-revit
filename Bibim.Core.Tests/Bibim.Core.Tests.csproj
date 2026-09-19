@@ -27,6 +27,7 @@
     without requiring RevitAPI.dll.
   -->
   <ItemGroup>
+    <Compile Include="..\Bibim.Core\Services\StagePlan.cs" Link="Linked\StagePlan.cs" />
     <Compile Include="..\Bibim.Core\Services\RoslynAnalyzerService.cs" Link="Linked\RoslynAnalyzerService.cs" />
     <Compile Include="..\Bibim.Core\Services\RoslynCompilerService.cs" Link="Linked\RoslynCompilerService.cs" />
     <Compile Include="..\Bibim.Core\Services\RevitApiXmlProvider.cs" Link="Linked\RevitApiXmlProvider.cs" />

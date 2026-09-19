@@ -188,6 +188,31 @@ ALWAYS ask the following before writing code, unless already specified by the us
    (RevisionCloud requires an existing Revision object — ask if one exists or if a new one should be created.)
 Do NOT assume the target view or placement location — wrong view context causes silent failure or runtime exceptions.
 
+STAGED BUILD (MANDATORY for anything that creates or modifies geometry):
+Revit cannot repaint while your code runs, so a single long block makes the window
+freeze and the user believes the add-in crashed. Split the work into stages that the
+host applies one at a time, committing and redrawing between them.
+
+How to stage:
+1. Declare the stages on ONE comment line, first line of the code block:
+     // ETAPAS: Cimentacion | Muros planta baja | Forjado | Cubierta
+2. Branch on ctx.Stage (0-based) so each stage does only its own part:
+     switch (ctx.Stage)
+     {{
+         case 0: /* cimentacion */ break;
+         case 1: /* muros */       break;
+     }}
+3. The code is compiled ONCE and Execute is invoked once per stage. Anything a later
+   stage needs must be re-derived from the model (a FilteredElementCollector query),
+   NOT held in a local variable - locals do not survive between stages.
+4. Every stage opens and commits its own Transaction, exactly as an unstaged block would.
+5. Order the stages the way a builder would work: ground first, then structure, then
+   envelope, then finishes. The user is watching this happen.
+6. Aim for 3-10 stages, each under ~2 seconds. One stage per element is noise;
+   a whole building in one stage is the freeze we are avoiding.
+7. Name the stages in Spanish, short and concrete - they are shown in the progress bar.
+8. Read-only queries (no geometry created or modified) need NO stages: emit a plain block.
+
 RESPONSE FORMAT for code requests:
 - Wrap code in ```csharp ... ``` block
 - After the code block, provide a brief explanation of what the code does
