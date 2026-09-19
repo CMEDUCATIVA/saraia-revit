@@ -224,6 +224,25 @@ namespace Bibim.Core
                 return;
             }
 
+            // Plan de etapas. La directiva "// ETAPAS: a | b | c" del propio codigo es
+            // la fuente de verdad: asi el llamante no tiene que repetir stageCount ni
+            // los nombres en cada llamada. stageCount/stageLabel explicitos mandan
+            // sobre la directiva cuando se envian.
+            var plan = StagePlan.Parse(req.Code);
+            int stageCount = req.StageCount > 1 ? req.StageCount : plan.Count;
+            List<string> stageNames = null;
+            if (plan.Count > 1)
+                stageNames = new List<string>(plan);
+            if (!string.IsNullOrWhiteSpace(req.StageLabel) && req.StageIndex >= 0)
+            {
+                // La etiqueta es el nombre de ESTA etapa: va en su posicion, no en la 0.
+                stageNames = stageNames ?? new List<string>();
+                while (stageNames.Count <= req.StageIndex)
+                    stageNames.Add(StagePlan.NameAt(null, stageNames.Count));
+                stageNames[req.StageIndex] = req.StageLabel;
+                stageCount = Math.Max(stageCount, req.StageIndex + 1);
+            }
+
             var request = new ExecutionRequest
             {
                 CompiledAssembly = compile.Assembly,
@@ -233,9 +252,8 @@ namespace Bibim.Core
                 CaptureImage = req.Capture,
                 CaptureWidth = req.CaptureWidth,
                 StageIndex = req.StageIndex,
-                StageCount = Math.Max(1, req.StageCount),
-                StageNames = string.IsNullOrWhiteSpace(req.StageLabel)
-                    ? null : new List<string> { req.StageLabel },
+                StageCount = Math.Max(1, stageCount),
+                StageNames = stageNames,
                 Callback = new TaskCompletionSource<ExecutionResult>(TaskCreationOptions.RunContinuationsAsynchronously)
             };
             BibimApp.ExecutionHandler.Enqueue(request);
