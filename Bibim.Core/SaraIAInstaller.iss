@@ -4,7 +4,7 @@
 
 #define MyAppName "SaraIA Revit"
 #ifndef MyAppVersion
-  #define MyAppVersion "1.1.0"
+  #define MyAppVersion "1.2.0"
 #endif
 #define MyAppPublisher "CMEDUCATIVA"
 #define MyAppURL "https://github.com/CMEDUCATIVA/saraia-revit"
@@ -48,12 +48,12 @@ FinishedHeadingLabel=SaraIA Revit se instaló correctamente
 FinishedLabel=SaraIA Revit ya está instalado.%n%nAbre Autodesk Revit y busca la pestaña SaraIA en la cinta superior. Desde Ajustes podrás configurar tus claves de OpenAI, Claude, Gemini, DeepSeek o modelos locales.
 
 [Files]
-Source: "bin\R2022\net48\*"; DestDir: "{app}\2022"; Flags: ignoreversion recursesubdirs skipifsourcedoesntexist
-Source: "bin\R2023\net48\*"; DestDir: "{app}\2023"; Flags: ignoreversion recursesubdirs skipifsourcedoesntexist
-Source: "bin\R2024\net48\*"; DestDir: "{app}\2024"; Flags: ignoreversion recursesubdirs skipifsourcedoesntexist
-Source: "bin\R2025\net8.0-windows\*"; DestDir: "{app}\2025"; Flags: ignoreversion recursesubdirs skipifsourcedoesntexist
-Source: "bin\R2026\net8.0-windows\*"; DestDir: "{app}\2026"; Flags: ignoreversion recursesubdirs skipifsourcedoesntexist
-Source: "bin\R2027\net10.0-windows\*"; DestDir: "{app}\2027"; Flags: ignoreversion recursesubdirs skipifsourcedoesntexist
+Source: "bin\R2022\net48\*"; DestDir: "{app}\2022"; Flags: ignoreversion recursesubdirs; Check: VersionSelected(0)
+Source: "bin\R2023\net48\*"; DestDir: "{app}\2023"; Flags: ignoreversion recursesubdirs; Check: VersionSelected(1)
+Source: "bin\R2024\net48\*"; DestDir: "{app}\2024"; Flags: ignoreversion recursesubdirs; Check: VersionSelected(2)
+Source: "bin\R2025\net8.0-windows\*"; DestDir: "{app}\2025"; Flags: ignoreversion recursesubdirs; Check: VersionSelected(3)
+Source: "bin\R2026\net8.0-windows\*"; DestDir: "{app}\2026"; Flags: ignoreversion recursesubdirs; Check: VersionSelected(4)
+Source: "bin\R2027\net10.0-windows\*"; DestDir: "{app}\2027"; Flags: ignoreversion recursesubdirs; Check: VersionSelected(5)
 Source: "redist\MicrosoftEdgeWebview2Setup.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall
 Source: "Assets\Icons\SaraIA-icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "Assets\Icons\saraia-icon.svg"; DestDir: "{app}"; Flags: ignoreversion
@@ -112,7 +112,12 @@ end;
 
 function RevitInstallExists(Year: string): Boolean;
 begin
-  Result := DirExists('C:\Program Files\Autodesk\Revit ' + Year);
+  Result := FileExists(ExpandConstant('{commonpf64}') + '\Autodesk\Revit ' + Year + '\RevitAPI.dll');
+end;
+
+function VersionSelected(Index: Integer): Boolean;
+begin
+  Result := VersionPage.Values[Index];
 end;
 
 function AddinPath(Year: string; FileName: string): string;
@@ -129,6 +134,7 @@ function PreviousInstallExists: Boolean;
 begin
   Result :=
     DirExists(ExpandConstant('{autopf}\SaraIA Revit')) or
+    DirExists(ExpandConstant('{autopf}\SaraIA')) or
     DirExists(ExpandConstant('{autopf}\Bibim')) or
     FileExists(AddinPath('2022', 'SaraIA.Core.addin')) or
     FileExists(AddinPath('2023', 'SaraIA.Core.addin')) or
@@ -189,6 +195,10 @@ begin
 
   if DirExists(ExpandConstant('{autopf}\Bibim')) then
     DelTree(ExpandConstant('{autopf}\Bibim'), True, True, True);
+
+  // Ubicacion de las instalaciones manuales anteriores (net48 / net8.0 / net10.0).
+  if DirExists(ExpandConstant('{autopf}\SaraIA')) then
+    DelTree(ExpandConstant('{autopf}\SaraIA'), True, True, True);
 end;
 
 function InitializeSetup: Boolean;
@@ -200,25 +210,27 @@ begin
 
   if IsRevitRunning then
   begin
-    MsgBox(
+    SuppressibleMsgBox(
       'Autodesk Revit está abierto.' + #13#10 + #13#10 +
       'Cierra Revit antes de instalar SaraIA para evitar archivos bloqueados.',
       mbError,
-      MB_OK);
+      MB_OK,
+      IDOK);
     Result := False;
     exit;
   end;
 
   if PreviousInstallExists then
   begin
-    Answer := MsgBox(
+    Answer := SuppressibleMsgBox(
       'Se encontró una instalación previa de SaraIA Revit o Bibim.' + #13#10 + #13#10 +
       'Se recomienda limpiar la versión anterior antes de continuar para evitar manifiestos duplicados o DLL antiguas.' + #13#10 + #13#10 +
       'Sí: limpiar versión anterior y continuar.' + #13#10 +
       'No: continuar sin limpiar.' + #13#10 +
       'Cancelar: salir del instalador.',
       mbConfirmation,
-      MB_YESNOCANCEL);
+      MB_YESNOCANCEL,
+      IDYES);
 
     if Answer = IDCANCEL then
     begin
@@ -232,18 +244,21 @@ begin
   end;
 end;
 
-function NeedsWebView2Runtime: Boolean;
+function WebView2Registered(Root: Integer; Key: string): Boolean;
 var
   Version: string;
 begin
-  Result := not RegQueryStringValue(
-    HKLM, 'SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}',
-    'pv', Version);
+  // Microsoft documenta que un "pv" vacio o 0.0.0.0 indica runtime desinstalado.
+  Result := RegQueryStringValue(Root, Key, 'pv', Version) and
+            (Version <> '') and (Version <> '0.0.0.0');
+end;
 
-  if Result then
-    Result := not RegQueryStringValue(
-      HKCU, 'Software\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}',
-      'pv', Version);
+function NeedsWebView2Runtime: Boolean;
+begin
+  Result := not (
+    WebView2Registered(HKLM, 'SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}') or
+    WebView2Registered(HKLM, 'SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}') or
+    WebView2Registered(HKCU, 'Software\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'));
 end;
 
 procedure InitializeWizard;
@@ -254,7 +269,7 @@ begin
     wpSelectDir,
     'Seleccionar versión de Revit',
     'Elige en qué versión de Autodesk Revit deseas instalar SaraIA.',
-    'El instalador solo activará SaraIA en las versiones seleccionadas. Las versiones sin binario disponible aparecen deshabilitadas.',
+    'Vienen marcadas las versiones de Revit instaladas en este equipo. Solo se copian los archivos de las versiones que selecciones.',
     True,
     False);
 

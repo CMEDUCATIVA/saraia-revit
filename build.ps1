@@ -216,18 +216,12 @@ if (-not $SkipInstaller) {
     }
 
     if ($isccExe) {
-        # Build KO installer
-        if ($Lang -eq "all" -or $Lang -eq "ko") {
-            Write-Host "  Building KO installer..." -ForegroundColor Gray
-            & $isccExe "/DMyBuildId=$buildId" "/DMyAppVersion=$appVersion" "$root\Bibim.Core\BibimInstaller.iss"
-            if ($LASTEXITCODE -ne 0) { throw "KO installer build failed" }
-        }
-        # Build EN installer
-        if ($Lang -eq "all" -or $Lang -eq "en") {
-            Write-Host "  Building EN installer..." -ForegroundColor Gray
-            & $isccExe "/DMyBuildId=$buildId" "/DMyAppVersion=$appVersion" "$root\Bibim.Core\BibimInstaller_EN.iss"
-            if ($LASTEXITCODE -ne 0) { throw "EN installer build failed" }
-        }
+        # Un unico instalador: SaraIAInstaller.iss lleva las seis versiones de Revit
+        # y copia solo las que el usuario selecciona. Los BibimInstaller*.iss son
+        # los instaladores antiguos del proyecto original y ya no se generan.
+        Write-Host "  Building SaraIA installer..." -ForegroundColor Gray
+        & $isccExe "/DMyBuildId=$buildId" "/DMyAppVersion=$appVersion" "$root\Bibim.Core\SaraIAInstaller.iss"
+        if ($LASTEXITCODE -ne 0) { throw "SaraIA installer build failed" }
         Write-Host "[4/5] Installer done" -ForegroundColor Green
 
         $setupExes = Get-ChildItem "$root\Bibim.Core\Output\*.exe" -ErrorAction SilentlyContinue
